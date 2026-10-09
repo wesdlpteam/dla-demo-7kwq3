@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Wesley Digital Learning Assistant</title>
-<script>window.APP_VERSION='2026-08-13-1';</script>
+<script>window.APP_VERSION='2026-10-09-1';</script>
 <meta name="robots" content="noindex, nofollow">
 <script>/* ===== DLA sandbox guard ===== */
 /* DLA sandbox guard. Installed before any page code runs.
@@ -2535,23 +2535,29 @@ function normaliseLeaderboard(data){
     };
   }).filter(function(t){return t.campus&&t.year&&t.year!=='Unknown';});
 }
-function mergeLeaderboard(existing,incoming){
+// One team can arrive as several rows when the sheet holds more than one
+// spelling of its campus ('St Kilda Rd' alongside 'St Kilda Road'). Those rows
+// tidy up to the same key here, so they are added together — keeping only the
+// last one made a team's score drop to whatever its newest row was worth.
+function foldLeaderboardRows(rows){
   var map={};
-  function put(t){
+  (rows||[]).forEach(function(t){
     if(!t)return;
     var campus=normaliseCampusName(t.campus);
     var year=normaliseYearName(t.year);
     var key=campus+'|'+year;
-    var points=Number(t.points||0)||0;
-    var streaks=Number(t.streaks||0)||0;
-    if(!map[key])map[key]={campus:campus,year:year,points:points,streaks:streaks};
-    else{
-      map[key].points=points;
-      map[key].streaks=streaks;
-    }
-  }
-  (existing||[]).forEach(function(t){put(t);});
-  (incoming||[]).forEach(function(t){put(t);});
+    if(!map[key])map[key]={campus:campus,year:year,points:0,streaks:0};
+    map[key].points+=Number(t.points||0)||0;
+    map[key].streaks+=Number(t.streaks||0)||0;
+  });
+  return map;
+}
+function mergeLeaderboard(existing,incoming){
+  var map=foldLeaderboardRows(existing);
+  var fresh=foldLeaderboardRows(incoming);
+  // A fresh payload is the whole truth for the teams it names, so it replaces
+  // those totals outright rather than stacking on the cached ones.
+  Object.keys(fresh).forEach(function(k){map[k]=fresh[k];});
   return Object.keys(map).map(function(k){return map[k];});
 }
 var _lbJsonpSeq=0;
@@ -2880,8 +2886,9 @@ _analyticsFlushTimer=setTimeout(function(){_flushAnalytics(false);},30000);
 
 function trackPage(name,campus,year){
 var spent=Math.round((Date.now()-_pageStart)/1000);
-// Only queue events where the user actually spent time on the page (2s–10min)
-if(spent>=2&&spent<=600){
+// Only queue real pages the user spent time on (2s to 10min). 'exit' is the
+// placeholder while the tab is hidden or closing, never a page.
+if(_pageName!=='exit'&&spent>=2&&spent<=600){
 _analyticsQueue.push({page:_pageName,campus:_pageCampus,year:_pageYear,seconds:spent});
 _scheduleFlush();
 // Flush immediately if queue is getting large (e.g. very active session)
@@ -2890,10 +2897,24 @@ if(_analyticsQueue.length>=8)_flushAnalytics(false);
 _pageStart=Date.now();_pageName=name;_pageCampus=campus||"";_pageYear=year||"";}
 
 // Use sendBeacon on unload — reliable, non-blocking, won't trigger another concurrent write
+// Tab hidden: bank the time on the current page, then hold it until the tab
+// comes back, so time away is not counted and no fake 'exit' page is logged.
+var _pausedPage=null;
+function _pauseTracking(){
+if(_pageName==='exit')return;
+_pausedPage={name:_pageName,campus:_pageCampus,year:_pageYear};
+trackPage('exit','','');
+}
+function _resumeTracking(){
+if(!_pausedPage)return;
+var p=_pausedPage;_pausedPage=null;
+_pageStart=Date.now();_pageName=p.name;_pageCampus=p.campus;_pageYear=p.year;
+}
 window.addEventListener('visibilitychange',function(){
-if(document.visibilityState==='hidden'){trackPage('exit','','');_flushAnalytics(true);}
+if(document.visibilityState==='hidden'){_pauseTracking();_flushAnalytics(true);}
+else{_resumeTracking();}
 });
-window.addEventListener('beforeunload',function(){trackPage('exit','','');_flushAnalytics(true);});
+window.addEventListener('beforeunload',function(){_pauseTracking();_flushAnalytics(true);});
 
 </script>
 

@@ -142,7 +142,7 @@
 
 /* KPI strip */
 .kpi-strip{
-  display:grid;gap:12px;grid-template-columns:repeat(5,minmax(0,1fr));
+  display:grid;gap:12px;grid-template-columns:repeat(4,minmax(0,1fr));
   margin-bottom:14px;
 }
 @media (max-width:1100px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -201,6 +201,27 @@
   text-align:center;font-weight:800;font-size:14px;padding:10px 6px;
   border-radius:8px;min-width:64px;background:var(--card2);
 }
+/* Team grid (Adoption): last activity per campus + year level */
+.team-grid td.team-cell{font-size:12px;font-weight:700;min-width:84px}
+.team-cell.team-active{background:rgba(82,185,92,.22);color:#7ee08a}
+.team-cell.team-quiet{background:rgba(245,166,35,.18);color:#f5c36b}
+.team-cell.team-idle,.team-cell.team-never{background:var(--card2);color:var(--dim)}
+.team-cell.team-none{background:transparent;color:#444}
+.team-legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:11px;color:var(--dim)}
+.team-key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
+.team-key.team-active{background:rgba(82,185,92,.6)}
+.team-key.team-quiet{background:rgba(245,166,35,.6)}
+.team-key.team-idle{background:#333}
+
+/* Engagement steps */
+.step-row{display:flex;align-items:stretch;gap:8px;flex-wrap:wrap}
+.step-box{flex:1 1 150px;background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.step-lbl{font-size:10px;color:var(--dim);text-transform:uppercase;font-weight:700;letter-spacing:1.2px;margin-bottom:6px}
+.step-num{font-size:28px;font-weight:900;line-height:1.1}
+.step-sub{font-size:11px;color:var(--text);margin-top:4px}
+.step-hint{font-size:11px;color:var(--dim);margin-top:2px;line-height:1.4}
+.step-arrow{align-self:center;color:var(--dim);font-size:18px}
+@media (max-width:600px){.step-arrow{display:none}}
 
 /* Dead suggestions list */
 .dead-list{font-size:12px;color:var(--dim);line-height:1.6}
@@ -419,7 +440,7 @@
   .sug-desc,.chat-bubble,.insight-body,.ai-summary-body,a{overflow-wrap:anywhere}
   .fb-ci-chip{max-width:100%}
   #live-content,#audit-chart,#comparison-grid,#browse-list{min-width:0;max-width:100%}
-  #live-growth-chart,#live-campus-chart,#live-year-coverage,#live-funnel,
+  #live-growth-chart,#live-campus-chart,
   #live-top-pages,#rankings-most-used-chart{max-width:100%;min-width:0}
 
   button,.nav-item,.btn,.btn-sm,.btn-pri,.view-tab,.analytics-subtab,.ranking-scope,

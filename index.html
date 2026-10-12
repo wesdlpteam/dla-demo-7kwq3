@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Wesley Digital Learning Assistant</title>
-<script>window.APP_VERSION='2026-10-09-1';</script>
+<script>window.APP_VERSION='2026-10-11-1';</script>
 <meta name="robots" content="noindex, nofollow">
 <script>/* ===== DLA sandbox guard ===== */
 /* DLA sandbox guard. Installed before any page code runs.
@@ -835,12 +835,12 @@ function removeTechChip(campus,yl,theme,tool){
 function renderTechPickerPrompt(campus,yl,theme,ci,lo){
   var chips=getTechChips(campus,yl,theme);
   var chipsHtml='';
-  var caEnc=encodeURIComponent(campus),ylEnc=encodeURIComponent(yl),thEnc=encodeURIComponent(theme);
-  var ciEnc=encodeURIComponent(ci||''),loEnc=encodeURIComponent(lo||'');
+  var caEnc=encAttr_(campus),ylEnc=encAttr_(yl),thEnc=encAttr_(theme);
+  var ciEnc=encAttr_(ci||''),loEnc=encAttr_(lo||'');
   if(chips.length){
     chipsHtml='<div class="tech-chips">';
     chips.forEach(function(t){
-      var tEnc=encodeURIComponent(t);
+      var tEnc=encAttr_(t);
       var tSafe=escapeHtml(t);
       chipsHtml+='<span class="tech-chip">'
         +'<button type="button" class="tech-chip-main" onclick="reopenTechChip(\''+caEnc+'\',\''+ylEnc+'\',\''+thEnc+'\',\''+tEnc+'\',\''+ciEnc+'\',\''+loEnc+'\')" title="Reopen suggestion for '+tSafe+'">🔧 '+tSafe+'</button>'
@@ -876,15 +876,15 @@ function openTechPicker(campusEnc,ylEnc,themeEnc,ciEnc,loEnc){
     body='<div class="tech-error">Tool list is still loading — please try again in a moment.</div>';
   } else {
     var tilesHtml=tools.slice().sort().map(function(t){
-      var safe=t.replace(/"/g,'&quot;');
-      return '<button class="tech-tile" data-tool="'+safe+'" onclick="pickTech(this,\''+encodeURIComponent(campus)+'\',\''+encodeURIComponent(yl)+'\',\''+encodeURIComponent(theme)+'\')">'+t+'</button>';
+      var safe=escapeHtml(t);
+      return '<button class="tech-tile" data-tool="'+safe+'" onclick="pickTech(this,\''+encAttr_(campus)+'\',\''+encAttr_(yl)+'\',\''+encAttr_(theme)+'\')">'+safe+'</button>';
     }).join('');
     body='<input class="tech-search" id="techSearch" placeholder="Search tools…" oninput="filterTechTiles(this.value)" autocomplete="off"/>' +
       '<div class="tech-grid" id="techGrid">'+tilesHtml+'</div>';
   }
   var html='<div class="tech-modal" role="dialog" aria-modal="true" aria-labelledby="techModalTitle">' +
     '<button type="button" class="tech-modal-close" onclick="closeTech()" aria-label="Close">✕</button>' +
-    '<div class="tech-modal-header"><div class="tech-modal-icon" aria-hidden="true">🔧</div><div><div id="techModalTitle" class="tech-modal-title">Pick a tool for this unit</div><div class="tech-modal-sub">'+yl+' · '+theme+'</div></div></div>' +
+    '<div class="tech-modal-header"><div class="tech-modal-icon" aria-hidden="true">🔧</div><div><div id="techModalTitle" class="tech-modal-title">Pick a tool for this unit</div><div class="tech-modal-sub">'+escapeHtml(yl)+' · '+escapeHtml(theme)+'</div></div></div>' +
     '<div class="tech-modal-body">'+body+'</div></div>';
   var overlay=document.createElement('div');
   overlay.id='techOverlay';
@@ -952,6 +952,12 @@ function openTechResult(campus,yl,theme,tool,regen,ci,lo,customCi,customLo){
 }
 
 function escapeHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+// Returns the address only when it is a plain http(s) link with no quotes, angle
+// brackets or spaces in it; otherwise '' so callers can leave the link out.
+function safeHttpUrl_(u){var s=typeof u==='string'?u.trim():'';return /^https?:\/\/[^\s"<>]+$/i.test(s)?s:'';}
+// encodeURIComponent that also encodes apostrophes, for values placed inside a
+// single-quoted argument of an inline onclick handler.
+function encAttr_(s){return encodeURIComponent(s==null?'':String(s)).replace(/'/g,'%27');}
 
 function fetchTechSuggestion(campus,yl,theme,tool,regen,customCi,customLo){
   var url=AI_HOOK
@@ -1019,6 +1025,7 @@ function renderTechResult(campus,yl,theme,tool,resp){
   var fitNote=resp.fitNote||'';
   var cachedNote=resp.cached?'Served from cache · click ↻ to regenerate':'Fresh suggestion · '+(resp.generatedAt?new Date(resp.generatedAt).toLocaleString():'just now');
   if(usingCustom)cachedNote='Based on your edited unit details · '+cachedNote;
+  cachedNote=escapeHtml(cachedNote);
   var noteHtml=(fit!=='good'&&fitNote)?'<div class="tech-fitnote">'+escapeHtml(fitNote)+'</div>':'';
   // 2026-06-04: Render the teacher-picked result as a full suggestion card —
   // icon+tool header, value-add, and the same engagement buttons as a normal
@@ -1036,12 +1043,12 @@ function renderTechResult(campus,yl,theme,tool,resp){
   // Value Add / How do I teach this / pinned chip. Stretch keeps the amber badge
   // and amber note border; poor keeps the red note border.
   if(fit==='poor'||fit==='stretch'){
-    var caE=encodeURIComponent(campus),ylE=encodeURIComponent(yl),thE=encodeURIComponent(theme),ciE=encodeURIComponent(editorCi||''),loE=encodeURIComponent(editorLo||'');
+    var caE=encAttr_(campus),ylE=encAttr_(yl),thE=encAttr_(theme),ciE=encAttr_(editorCi||''),loE=encAttr_(editorLo||'');
     body.innerHTML=
       '<div class="sg" style="margin-bottom:14px">' +
         '<div class="sg-head"><div class="sg-icon" style="background:'+tc+'">'+em+'</div><div class="sg-meta"><div class="sg-type">Honest fit check</div><div class="sg-tool">'+escapeHtml(tool)+'</div></div></div>' +
         '<div class="sg-body">' +
-          '<div class="tech-fit '+fit+'" style="margin-bottom:10px">'+fitLabel+'</div>' +
+          '<div class="tech-fit '+escapeHtml(fit)+'" style="margin-bottom:10px">'+fitLabel+'</div>' +
           '<div class="sg-desc">'+linkifyDesc(desc)+'</div>' +
           (fitNote?'<div class="tech-fitnote"'+(fit==='poor'?' style="border-left-color:#FF6B6B"':'')+'>'+escapeHtml(fitNote)+'</div>':'') +
         '</div>' +
@@ -1065,7 +1072,7 @@ function renderTechResult(campus,yl,theme,tool,resp){
     '<div class="sg" style="margin-bottom:14px">' +
       '<div class="sg-head"><div class="sg-icon" style="background:'+tc+'">'+em+'</div><div class="sg-meta"><div class="sg-type">Your chosen tool</div><div class="sg-tool">'+escapeHtml(tool)+'</div></div></div>' +
       '<div class="sg-body">' +
-        '<div class="tech-fit '+fit+'" style="margin-bottom:10px">'+fitLabel+'</div>' +
+        '<div class="tech-fit '+escapeHtml(fit)+'" style="margin-bottom:10px">'+fitLabel+'</div>' +
         noteHtml +
         '<div class="sg-desc">'+linkifyDesc(desc)+'</div>' +
         (va?'<div class="sg-section"><div class="sg-label">Value Add</div><div class="vb" style="border-left-color:'+tc+'">'+escapeHtml(va)+'</div></div>':'') +
@@ -1213,7 +1220,7 @@ function startUoiEdit(){
       +'</div>';
   });
 
-  var caEnc=encodeURIComponent(campus),ylEnc=encodeURIComponent(yl),thEnc=encodeURIComponent(theme);
+  var caEnc=encAttr_(campus),ylEnc=encAttr_(yl),thEnc=encAttr_(theme);
   var html=
     '<div class="tech-modal uoi-modal" role="dialog" aria-modal="true" aria-labelledby="uoiModalTitle">'
       +'<button type="button" class="tech-modal-close" onclick="closeUoiEdit()" aria-label="Close">✕</button>'
@@ -2123,9 +2130,9 @@ h+='</div>';}
 
 else if(v==="units"){
 const us=gu(ca,yl);
-h+='<div style="margin:20px 0 28px"><div style="display:flex;gap:6px;flex-wrap:wrap"><span class="tag" style="background:'+CC[ca]+';color:'+CTX[ca]+'">'+CN[ca]+'</span><span class="tag">'+yl+'</span></div><h2 class="sec-title">Units of Inquiry</h2></div>';
+h+='<div style="margin:20px 0 28px"><div style="display:flex;gap:6px;flex-wrap:wrap"><span class="tag" style="background:'+CC[ca]+';color:'+CTX[ca]+'">'+CN[ca]+'</span><span class="tag">'+escapeHtml(yl)+'</span></div><h2 class="sec-title">Units of Inquiry</h2></div>';
 us.forEach((u,i)=>{const tc=TC[u.th]||"#888";const em=TE[u.th]||"💡";
-h+='<div class="uc" style="background:'+tc+';color:'+(TTX[u.th]||"#FFF")+'" onclick="nv(\'ui\','+i+')"><div class="uc-emoji">'+em+'</div><div class="uc-label">Transdisciplinary Theme</div><div class="uc-name">'+u.th+'</div></div>';});}
+h+='<div class="uc" style="background:'+tc+';color:'+(TTX[u.th]||"#FFF")+'" onclick="nv(\'ui\','+i+')"><div class="uc-emoji">'+em+'</div><div class="uc-label">Transdisciplinary Theme</div><div class="uc-name">'+escapeHtml(u.th)+'</div></div>';});}
 
 else if(v==="detail"){
 const us=gu(ca,yl),u=us[ui];if(!u){S.v='units';S.ui=null;R();return;}const tc=TC[u.th]||"#888";const em=TE[u.th]||"💡";
@@ -2134,7 +2141,7 @@ const us=gu(ca,yl),u=us[ui];if(!u){S.v='units';S.ui=null;R();return;}const tc=TC
 // display + Edit button (default) and editable textareas (edit mode).
 h+='<div class="dh" style="background:'+tc+';color:'+(TTX[u.th]||"#FFF")+'">'+'<div class="dh-wm">'+em+'</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;position:relative;z-index:1"><span class="tag-t">'+escapeHtml(yl)+'</span><span class="tag-t">'+escapeHtml(CN[ca])+'</span></div><h2 class="dh-title" style="position:relative;z-index:1">'+escapeHtml(u.th)+'</h2>'+(u.ci?'<div class="dh-ci" style="position:relative;z-index:1">“'+escapeHtml(u.ci)+'”</div>':'')+'</div>';
 
-var _uoiCaEnc=encodeURIComponent(CN[ca]||ca),_uoiYlEnc=encodeURIComponent(yl),_uoiThEnc=encodeURIComponent(u.th);
+var _uoiCaEnc=encAttr_(CN[ca]||ca),_uoiYlEnc=encAttr_(yl),_uoiThEnc=encAttr_(u.th);
 var _existingProposal=getLocalUoiProposal(CN[ca]||ca,yl,u.th);
 var _pendingBanner=_existingProposal?'<div class="uoi-pending-pill" style="margin:0 0 12px">✓ Submitted for approval · '+new Date(_existingProposal.submittedAt).toLocaleDateString()+' <button title="Forget the local submitted reminder (does not withdraw from the review queue)" onclick="clearLocalProposalForUnit(\''+_uoiCaEnc+'\',\''+_uoiYlEnc+'\',\''+_uoiThEnc+'\')" aria-label="Forget reminder">×</button></div>':'';
 
@@ -2189,12 +2196,12 @@ var toolLabel=turl?'<a href="'+escapeHtml(turl)+'" target="_blank" rel="noopener
 var phaseLabel="Suggestion";
 h+='<div class="sg"><div class="sg-head"><div class="sg-icon" style="background:'+tc+'">'+em+'</div><div class="sg-meta"><div class="sg-type">'+'Idea #'+(si+1)+' of '+mainSugs.length+'</div><div class="sg-tool">'+toolLabel+'</div></div></div><div class="sg-body">';
 h+='<div class="sg-desc">'+linkifyDesc(s.d)+'</div>';
-var _lessonUrl=(s.url&&String(s.url).trim())||(function(){var m=(s.d||'').match(/https?:\/\/[^\s)]+/);return m?m[0]:'';})();
+var _lessonUrl=safeHttpUrl_((s.url&&String(s.url).trim())||(function(){var m=(s.d||'').match(/https?:\/\/[^\s)]+/);return m?m[0]:'';})());
 var _lessonLabel=/minecraft\.net/i.test(_lessonUrl)?'Open Minecraft lesson':/microbit\.org/i.test(_lessonUrl)?'Open micro:bit lesson':_lessonUrl?'Open lesson page':'';
-if(_lessonUrl){h+='<a class="sg-lesson-btn" href="'+_lessonUrl+'" target="_blank" rel="noopener noreferrer"><span class="sg-lesson-ico">&#128279;</span><span class="sg-lesson-main">'+_lessonLabel+'</span><span class="sg-lesson-arrow">&rarr;</span></a>';}
-if(s.ref||s.docKey){var _rl='<div class="sg-section sg-refs"><div class="sg-label"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h8M4 8h8M4 12h5"/><rect x="2" y="2" width="12" height="12" rx="2"/></svg> Resources</div>';if(s.docKey&&window.DOCS&&DOCS[s.docKey]){var _doc=DOCS[s.docKey];_rl+='<a class="sg-ref-link sg-ref-doc" href="'+_doc.url+'" download="'+_doc.n+'" target="_blank">&#11015;&#65039; '+_doc.n+'</a>';}if(s.ref){s.ref.forEach(function(r){_rl+='<a class="sg-ref-link" href="'+r.url+'" target="_blank" rel="noopener">&#128279; '+r.label+'</a>';});}h+=_rl+'</div>';}
+if(_lessonUrl){h+='<a class="sg-lesson-btn" href="'+escapeHtml(_lessonUrl)+'" target="_blank" rel="noopener noreferrer"><span class="sg-lesson-ico">&#128279;</span><span class="sg-lesson-main">'+_lessonLabel+'</span><span class="sg-lesson-arrow">&rarr;</span></a>';}
+if(s.ref||s.docKey){var _rl='<div class="sg-section sg-refs"><div class="sg-label"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h8M4 8h8M4 12h5"/><rect x="2" y="2" width="12" height="12" rx="2"/></svg> Resources</div>';var _rn=0;if(s.docKey&&window.DOCS&&DOCS[s.docKey]){var _doc=DOCS[s.docKey];_rn++;_rl+='<a class="sg-ref-link sg-ref-doc" href="'+escapeHtml(_doc.url)+'" download="'+escapeHtml(_doc.n)+'" target="_blank">&#11015;&#65039; '+escapeHtml(_doc.n)+'</a>';}if(Array.isArray(s.ref)){s.ref.forEach(function(r){var _ru=safeHttpUrl_(r&&r.url);if(!_ru)return;_rn++;_rl+='<a class="sg-ref-link" href="'+escapeHtml(_ru)+'" target="_blank" rel="noopener">&#128279; '+escapeHtml(r.label)+'</a>';});}if(_rn)h+=_rl+'</div>';}
 h+='<div class="sg-section"><div class="sg-label">'+I.s+' Value Add</div><div class="vb" style="border-left-color:'+tc+'">'+va+'</div></div>';
-var _cpResources=[];if(_lessonUrl){_cpResources.push({label:_lessonLabel,url:_lessonUrl});}if(s.docKey&&window.DOCS&&DOCS[s.docKey]){_cpResources.push({label:DOCS[s.docKey].n,url:DOCS[s.docKey].url});}if(s.ref){s.ref.forEach(function(r){_cpResources.push({label:r.label,url:r.url});});}
+var _cpResources=[];if(_lessonUrl){_cpResources.push({label:_lessonLabel,url:_lessonUrl});}if(s.docKey&&window.DOCS&&DOCS[s.docKey]){_cpResources.push({label:DOCS[s.docKey].n,url:DOCS[s.docKey].url});}if(Array.isArray(s.ref)){s.ref.forEach(function(r){var _ru=safeHttpUrl_(r&&r.url);if(_ru)_cpResources.push({label:r.label,url:_ru});});}
 var _cpi=window._copilotData.length;window._copilotData.push({campus:CN[ca],year:yl,theme:u.th,centralIdea:u.ci,linesOfInquiry:lois.join('; '),tool:s.t,description:s.d,phase:'Idea #'+(si+1),resources:_cpResources});
 h+='<div class="sg-copilot"><button class="sg-copilot-btn" onclick="openCopilotHelper('+_cpi+',this)"><span class="sg-copilot-ico">🤖</span><span class="sg-copilot-main">How do I teach this?</span></button></div>';
 
@@ -2212,11 +2219,11 @@ h+='</div></div>';});
 h+=renderTechPickerPrompt(CN[ca],yl,u.th,u.ci||'',u.lo||'');
 
 // ACARA and Wesley curriculum toggles
-h+='<div class="tech-cur-toggle" id="techCurToggle" onclick="tgTechCur()"><span style="font-size:16px">📋</span><span style="flex:1;font-size:14px;font-weight:700;color:#38BDF8">ACARA Digital Technologies — '+yl+'</span><span style="font-size:12px;color:#888">Digital Technologies curriculum</span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 8 10 12 14 8"/></svg></div>';
+h+='<div class="tech-cur-toggle" id="techCurToggle" onclick="tgTechCur()"><span style="font-size:16px">📋</span><span style="flex:1;font-size:14px;font-weight:700;color:#38BDF8">ACARA Digital Technologies — '+escapeHtml(yl)+'</span><span style="font-size:12px;color:#888">Digital Technologies curriculum</span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 8 10 12 14 8"/></svg></div>';
 h+='<div class="tech-cur-body" id="techCurBody">'+renderTechCurriculum(yl)+'</div>';
 var _wdsScope=getWesleyDigitalSkillsScope(yl);
 if(_wdsScope){
-  h+='<div class="tech-cur-toggle wds-cur-toggle" id="wesleyCurToggle" onclick="tgWesleyCur()"><span style="font-size:16px">🟣</span><span style="flex:1;font-size:14px;font-weight:700;color:#9333EA">Wesley Digital Skills — '+yl+'</span><span style="font-size:12px;color:#888">'+_wdsScope.label+'</span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 8 10 12 14 8"/></svg></div>';
+  h+='<div class="tech-cur-toggle wds-cur-toggle" id="wesleyCurToggle" onclick="tgWesleyCur()"><span style="font-size:16px">🟣</span><span style="flex:1;font-size:14px;font-weight:700;color:#9333EA">Wesley Digital Skills — '+escapeHtml(yl)+'</span><span style="font-size:12px;color:#888">'+_wdsScope.label+'</span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 8 10 12 14 8"/></svg></div>';
   h+='<div class="tech-cur-body wds-cur-body" id="wesleyCurBody">'+renderWesleyDigitalSkillsOverview(yl)+'</div>';
 }
 
@@ -2442,7 +2449,7 @@ var popup=document.createElement('div');
 popup.className='point-popup-inline';
 popup.setAttribute('role','status');
 popup.setAttribute('aria-live','polite');
-popup.innerHTML='<div class="ppi-emoji">🎉</div><div class="ppi-text">+2 Points!</div><div class="ppi-sub">'+teamName+' Team</div>';
+popup.innerHTML='<div class="ppi-emoji">🎉</div><div class="ppi-text">+2 Points!</div><div class="ppi-sub">'+escapeHtml(teamName)+' Team</div>';
 document.body.appendChild(popup);
 _placeInlinePopup(popup,anchor);
 setTimeout(function(){popup.classList.add('fade-out');},2200);
@@ -2458,7 +2465,7 @@ var popup=document.createElement('div');
 popup.className='point-popup-inline';
 popup.setAttribute('role','status');
 popup.setAttribute('aria-live','polite');
-popup.innerHTML='<div class="ppi-emoji">🚀</div><div class="ppi-text">+1 Point!</div><div class="ppi-sub">Planning to try this — '+teamName+' Team</div>';
+popup.innerHTML='<div class="ppi-emoji">🚀</div><div class="ppi-text">+1 Point!</div><div class="ppi-sub">Planning to try this — '+escapeHtml(teamName)+' Team</div>';
 document.body.appendChild(popup);
 _placeInlinePopup(popup,anchor);
 setTimeout(function(){popup.classList.add('fade-out');},1800);
@@ -2477,7 +2484,7 @@ var popup=document.createElement('div');
 popup.className='point-popup-inline undo';
 popup.setAttribute('role','status');
 popup.setAttribute('aria-live','polite');
-popup.innerHTML='<div class="ppi-emoji">↩️</div><div class="ppi-text">−'+points+' Point'+(points===1?'':'s')+'</div><div class="ppi-sub">Removed — '+teamName+' Team</div>';
+popup.innerHTML='<div class="ppi-emoji">↩️</div><div class="ppi-text">−'+points+' Point'+(points===1?'':'s')+'</div><div class="ppi-sub">Removed — '+escapeHtml(teamName)+' Team</div>';
 document.body.appendChild(popup);
 _placeInlinePopup(popup,anchor);
 setTimeout(function(){popup.classList.add('fade-out');},1500);
@@ -2492,7 +2499,7 @@ var popup=document.createElement('div');
 popup.className='point-popup-inline streak';
 popup.setAttribute('role','status');
 popup.setAttribute('aria-live','polite');
-popup.innerHTML='<div class="ppi-emoji">🔥</div><div class="ppi-headline">Streak Bonus</div><div class="ppi-text">+3 Points!</div><div class="ppi-sub">'+teamName+' Team logged 3 tech suggestions for a unit</div>';
+popup.innerHTML='<div class="ppi-emoji">🔥</div><div class="ppi-headline">Streak Bonus</div><div class="ppi-text">+3 Points!</div><div class="ppi-sub">'+escapeHtml(teamName)+' Team logged 3 tech suggestions for a unit</div>';
 document.body.appendChild(popup);
 _placeInlinePopup(popup,anchor);
 setTimeout(function(){popup.classList.add('fade-out');},3200);
@@ -2677,7 +2684,7 @@ else{teams.forEach(function(t,i){
 var rc=i===0?'gold':i===1?'silver':i===2?'bronze':'';
 var pts=Number(t.points)||0;
 var streaks=Number(t.streaks)||0;
-h+='<div class="lb-row"><span class="lb-rank '+rc+'">#'+(i+1)+'</span><span class="lb-team">'+normaliseYearName(t.year)+' Team</span><span class="lb-pts">'+pts+' pts</span>';
+h+='<div class="lb-row"><span class="lb-rank '+rc+'">#'+(i+1)+'</span><span class="lb-team">'+escapeHtml(normaliseYearName(t.year))+' Team</span><span class="lb-pts">'+pts+' pts</span>';
 if(streaks>0)h+='<span class="lb-streak">🔥 '+streaks+' streak'+(streaks>1?'s':'')+'</span>';
 h+='</div>';
 });}
@@ -2780,6 +2787,8 @@ function readHash(){try{
   S.ca=ca; S.v='campus';
   if(ylSlug){
     var yl=unslugYL(ylSlug);
+    // Only official year levels are routed; anything else stays on the campus page.
+    if(YO.indexOf(yl)===-1)return;
     S.yl=yl; S.v='units';
     if(uiStr!==''&&uiStr!=null){
       var us=gu(ca,yl);

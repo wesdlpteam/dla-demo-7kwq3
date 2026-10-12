@@ -283,6 +283,7 @@ Return ONLY the JSON object, no markdown fences, no extra text.`;
       renderDashboard();
     } catch (err) {
       statusEl.textContent = `✓ ${completed} diversified but save failed: ${err.message}`;
+      showSaveError_(err);
     }
   } else {
     statusEl.style.color = 'var(--salmon)';
@@ -298,14 +299,6 @@ function stopAutoDiversify() {
 }
 
 function closeEntry(){
-  if(CURRENT_ENTRY_IDX !== null){
-    // Release lock in background
-    if(DATA._locks) delete DATA._locks[String(CURRENT_ENTRY_IDX)];
-    MY_LOCK_IDX = null;
-    stopLockHeartbeat();
-    saveLocks(); // fire-and-forget
-    renderLockIndicators();
-  }
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   const panel=document.getElementById('panel-'+PREV_TAB);
   if(panel) panel.classList.add('active');
@@ -328,7 +321,6 @@ const DASHBOARD_STATIC_BANNED_TOOLS = [
   'flipgrid', 'flip',
   'google earth',
   'google slides', 'google docs', 'google sheets',
-  'google streetview', 'google street view', 'google syncview',
   'microsoft teams', 'teams',
   'microsoft powerpoint', 'powerpoint',
   'microsoft onenote', 'onenote',
@@ -693,7 +685,8 @@ async function fixScrambledWiseCards(){
   });
   if(!fixed){ if(typeof setStatus==='function') setStatus('No scrambled Wise cards found ✓'); renderDashboard(); return; }
   if(typeof setStatus==='function') setStatus('Rebuilding '+fixed+' Wise card'+(fixed!==1?'s':'')+'…','loading');
-  await saveToDrive();
+  try{ await saveToDrive(); }
+  catch(saveErr){ showSaveError_(saveErr); renderDashboard(); return; }
   renderDashboard();
   if(typeof setStatus==='function') setStatus('✓ Rebuilt '+fixed+' scrambled Wise card'+(fixed!==1?'s':'')+' with clean quotes');
 }
@@ -906,7 +899,7 @@ function toggleHumanVerified(idx){
   const next = !isHumanVerifiedEntry_(entry);
   setHumanVerifiedForEntry_(idx, next);
   window._lastHumanVerifiedIdx = next ? idx : null;
-  saveToDrive();
+  saveToDrive().catch(showSaveError_);
   setStatus(next ? `Human verified: ${entry.yl} — ${entry.th}` : `Human verification removed: ${entry.yl} — ${entry.th}`);
   if(typeof renderBrowse === 'function') renderBrowse();
   if(CURRENT_ENTRY_IDX === idx && typeof renderEntry === 'function') renderEntry(idx);
@@ -918,32 +911,182 @@ function removeAllHumanVerified(){
   if(!count){ setStatus('No verified entries to reset'); return; }
   if(!confirm(`Remove human verification from all ${count} entries? This lets you start verifying from scratch.`)) return;
   DATA.forEach(function(entry, idx){ setHumanVerifiedForEntry_(idx, false); });
-  saveToDrive();
-  setStatus(`Cleared human verification from ${count} entries`);
+  saveToDrive().catch(showSaveError_);
+  setStatus(`Cleared human verification from ${count} entries (saving…)`, 'loading');
   if(typeof renderBrowse === 'function') renderBrowse();
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance box (Bulk screen, <details id="maintenance-box">).
+// Holds the few bulk jobs still worth running when new units are added:
+// Inspire All, the App Smash sweep and the Makerspace reboot. They always run
+// across ALL units (the Browse filters are not on the Bulk screen).
+//
+// Run state lives in window.DLA_MAINT:
+//   jobs      how many of the three jobs are running in this tab
+//   abortable how many of those can be stopped (Inspire All and the sweep; the
+//             Makerspace reboot does not read the abort flag)
+//   aborted   true after a run reported it was stopped by the abort flag, until
+//             Clear abort succeeds
+//   status    last status line, so a re-render does not lose it
+// STOP is shown only while abortable > 0; Clear abort only while aborted is true.
+// Every job sets/clears its run state in try/finally, which re-renders the box.
+// ---------------------------------------------------------------------------
+window.DLA_MAINT = window.DLA_MAINT || { jobs: 0, abortable: 0, aborted: false, status: '' };
+
+// Pure: progress numbers for the box. Mirrors the backend's rules: a unit is
+// inspire-eligible with a Central Idea and Lines of Inquiry; the Makerspace
+// reboot only counts audited units with 5+ suggestions, skips human-verified
+// units and units whose ca|yl|th key is shared with another unit.
+function maintenanceStats_(data){
+  const list = Array.isArray(data) ? data : [];
+  const fold = function(v){ return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase(); };
+  const keyOf = function(u){
+    let ca = fold(u.ca);
+    if(/^st kilda( (rd|road))?$/.test(ca)) ca = 'st kilda';
+    return [ca, fold(u.yl), fold(u.th)].join('|');
+  };
+  const counts = {};
+  list.forEach(function(u){ if(u && typeof u === 'object'){ const k = keyOf(u); counts[k] = (counts[k] || 0) + 1; } });
+  const has = function(v){ return !!(v && String(v).trim()); };
+  const st = { total: list.length, inspireTotal: 0, inspired: 0, inspireLeft: 0, skipped: 0, skippedList: [],
+    appSmash: 0, rebootTotal: 0, rebootDone: 0, rebootLeft: 0 };
+  list.forEach(function(u){
+    if(!u || typeof u !== 'object') return;
+    if(has(u.ci) && has(u.lo)){
+      st.inspireTotal++;
+      if(u.inspiringRegenAt) st.inspired++;
+    } else {
+      st.skipped++;
+      const missing = [];
+      if(!has(u.ci)) missing.push('CI');
+      if(!has(u.lo)) missing.push('LOI');
+      st.skippedList.push((u.ca || '') + ' · ' + (u.yl || '') + ' · ' + (u.th || '') + ' (missing ' + missing.join(' + ') + ')');
+    }
+    if(Array.isArray(u.s)){
+      for(let i = 0; i < 5 && i < u.s.length; i++){
+        const sg = u.s[i];
+        if(sg && typeof sg.t === 'string' && sg.t.indexOf('+') !== -1){ st.appSmash++; break; }
+      }
+    }
+    if(u.audited && Array.isArray(u.s) && u.s.length >= 5 && !u.humanVerified && counts[keyOf(u)] === 1){
+      st.rebootTotal++;
+      if(u.stemRebooted === true) st.rebootDone++;
+    }
+  });
+  st.inspireLeft = st.inspireTotal - st.inspired;
+  st.rebootLeft = st.rebootTotal - st.rebootDone;
+  return st;
+}
+
+// Pure: which controls the box shows.
+function maintenanceControls_(stats, state){
+  const st = stats || {};
+  const run = state || {};
+  return {
+    inspire: (st.inspireLeft || 0) > 0,
+    sweep: (st.appSmash || 0) > 0,
+    reboot: (st.rebootLeft || 0) > 0,
+    stop: (run.abortable || 0) > 0,
+    clearAbort: !!run.aborted
+  };
+}
+
+function maintStatus_(text){
+  window.DLA_MAINT.status = text || '';
+  const el = document.getElementById('maintenance-status');
+  if(el) el.textContent = window.DLA_MAINT.status;
+}
+
+// Object with a textContent setter, so the job loops can keep writing
+// "statusEl.textContent = ..." while the text lands in whichever status line is on screen.
+function maintStatusEl_(){
+  return { set textContent(v){ maintStatus_(v); } };
+}
+
+function maintJobStart_(abortable){
+  const m = window.DLA_MAINT;
+  m.jobs++;
+  if(abortable) m.abortable++;
+  renderMaintenanceBox();
+}
+
+function maintJobEnd_(abortable){
+  const m = window.DLA_MAINT;
+  m.jobs = Math.max(0, m.jobs - 1);
+  if(abortable) m.abortable = Math.max(0, m.abortable - 1);
+  renderMaintenanceBox();
+}
+
+function maintSetAborted_(flag){
+  window.DLA_MAINT.aborted = !!flag;
+  renderMaintenanceBox();
+}
+
+function renderMaintenanceBox(){
+  const body = document.getElementById('maintenance-body');
+  if(!body) return;
+  const run = window.DLA_MAINT;
+  const st = maintenanceStats_(DATA);
+  const ctl = maintenanceControls_(st, run);
+  const busy = run.jobs > 0;
+  const btnBase = 'padding:7px 14px;border-radius:8px;font-weight:800;font-size:12px;cursor:pointer;white-space:nowrap;';
+  const dis = busy ? ' disabled style="opacity:.55;cursor:not-allowed;' : ' style="';
+  const row = function(icon, text, buttonHtml){
+    return '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--border)">'
+      + '<span style="font-size:16px">' + icon + '</span>'
+      + '<span style="flex:1;min-width:220px;font-size:13px;color:var(--text);font-weight:700">' + text + '</span>'
+      + (buttonHtml || '') + '</div>';
+  };
+  const parts = [];
+  if(!st.total){
+    parts.push('<div style="font-size:13px;color:var(--dim);padding:6px 0">No units loaded yet. Open this box again once your data has loaded.</div>');
+  } else {
+    const skipNote = st.skipped
+      ? ', <span style="color:#fbbf24;cursor:help" title="' + esc(st.skippedList.join('\n')) + '">' + st.skipped + ' skipped (no Central Idea or Lines of Inquiry)</span>'
+      : '';
+    parts.push(row('✨', st.inspired + '/' + st.inspireTotal + ' units in the current idea style' + skipNote,
+      ctl.inspire ? '<button id="btn-inspire-all" onclick="inspireAllBatch()"' + dis + btnBase + 'background:#38BDF8;color:#0a1f2e;border:none" title="Regenerate each unit that is not yet in the current idea style. Takes a snapshot of data.json first. 4 units per batch.">Inspire All</button>' : ''));
+    if(ctl.sweep){
+      parts.push(row('🔥', st.appSmash + (st.appSmash === 1 ? ' unit still holds' : ' units still hold') + ' App Smash ("+") suggestions',
+        '<button id="btn-sweep-appsmashes" onclick="sweepAppSmashesBatch()"' + dis + btnBase + 'background:#F97316;color:#1a0e00;border:none" title="Regenerate every unit still holding a + App Smash suggestion as a single-tool idea.">Sweep App Smashes (' + st.appSmash + ')</button>'));
+    }
+    if(st.rebootTotal > 0){
+      parts.push(row('🛠', st.rebootDone + '/' + st.rebootTotal + ' Makerspace ideas redone' + (st.rebootLeft ? '' : ', all done'),
+        ctl.reboot ? '<button id="btn-reboot-makerspace" onclick="rebootMakerspaceBatch()"' + dis + btnBase + 'background:#A78BFA;color:#111;border:none" title="Replace the 6th (Makerspace) suggestion with a new hands-on project. Human-verified units are skipped.">Reboot makerspace (4 at a time)</button>' : ''));
+    }
+  }
+  if(ctl.stop || ctl.clearAbort){
+    const stopBtn = ctl.stop
+      ? '<button id="btn-maint-stop" onclick="inspireAllAbort()" style="' + btnBase + 'background:transparent;border:1px solid #DC2626;color:#DC2626" title="Emergency stop for Inspire All and the App Smash sweep. They stop at the next unit.">STOP</button>' : '';
+    const clearBtn = ctl.clearAbort
+      ? '<button id="btn-maint-clear-abort" onclick="inspireAllClearAbort()" style="' + btnBase + 'background:transparent;border:1px solid #888;color:#bbb" title="Clear the stop flag so the jobs can run again.">Clear abort</button>' : '';
+    parts.push(row('🛑', ctl.clearAbort ? 'A run was stopped. Clear the stop flag before running again.' : 'A job is running.', stopBtn + clearBtn));
+  }
+  parts.push('<div id="maintenance-status" style="font-size:12px;color:var(--dim);padding-top:8px;min-height:16px">' + esc(run.status || '') + '</div>');
+  body.innerHTML = parts.join('');
 }
 
 // v5.20: Makerspace reboot — calls GAS to replace the 6th suggestion with a new
 // catchy hands-on physical project. Processes up to 4 entries per batch.
 async function rebootMakerspaceBatch(){
-  const ca = document.getElementById('browse-campus')?.value || '';
-  const yr = document.getElementById('browse-year')?.value || '';
-  const scopeLabel = ca || yr ? ` (${[ca, yr].filter(Boolean).join(' · ')})` : '';
-  if(!confirm(`Reboot the Makerspace (#6) suggestion for entries${scopeLabel}? This processes 4 at a time and replaces only suggestion #6 — suggestions 1-5 are preserved.`)) return;
+  if(!confirm('Redo the Makerspace (#6) idea for the next 4 units? Only suggestion #6 is replaced, suggestions 1 to 5 are kept, and human-verified units are skipped.')) return;
 
-  setStatus(`Rebooting makerspace${scopeLabel}…`, 'loading');
+  maintJobStart_(false);
+  maintStatus_('Rebooting makerspace...');
+  setStatus('Rebooting makerspace…', 'loading');
   try {
     const payload = withGASToken({ action: 'rebootMakerspace' });
-    if(ca) payload.filterCa = ca;
-    if(yr) payload.filterYl = yr;
     const response = await fetch(SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload)
     });
     const result = await response.json();
-    if(result.error){ setStatus('Reboot error: ' + result.error, 'error'); return; }
-    setStatus(result.message || `Rebooted ${result.rebooted || 0} makerspace projects`, 'success');
+    if(result.error){ setStatus('Reboot error: ' + result.error, 'error'); maintStatus_('Reboot error: ' + result.error); return; }
+    const doneMsg = result.message || `Rebooted ${result.rebooted || 0} makerspace projects`;
+    setStatus(doneMsg, 'success');
+    maintStatus_(doneMsg);
     // Reload data from Drive so we see the new suggestions
     if(typeof loadFromDrive === 'function'){
       await loadFromDrive();
@@ -951,6 +1094,9 @@ async function rebootMakerspaceBatch(){
     }
   } catch(err) {
     setStatus('Reboot failed: ' + err.message, 'error');
+    maintStatus_('Reboot failed: ' + err.message);
+  } finally {
+    maintJobEnd_(false);
   }
 }
 
@@ -961,14 +1107,10 @@ async function rebootMakerspaceBatch(){
 // units already marked inspiringRegenAt so a mid-run failure or refresh
 // just resumes where we left off.
 async function inspireAllBatch(){
-  const ca = document.getElementById('f-campus')?.value || '';
-  const yr = document.getElementById('f-year')?.value || '';
-  const scopeLabel = ca || yr ? ` (${[ca, yr].filter(Boolean).join(' · ')})` : ' across all 3 campuses';
-  if(!confirm(`Regenerate EVERY unit${scopeLabel} in the new 6-sentence inspiring style?\n\n• Units WITHOUT a Central Idea + Lines of Inquiry are SKIPPED (the prompt has nothing to anchor on)\n• data.json will be snapshotted to Drive first (rollback path)\n• Early-years units (3YO, 4YO, Prep) get hands-on + screen-free emphasis\n• ~12 units per batch, ~3 min/batch\n• Estimated total: 25-35 min\n• Progress shows on the ✨ card; safe to leave running\n\nProceed?`)) return;
+  if(!confirm(`Regenerate EVERY unit across all 3 campuses in the new 6-sentence inspiring style?\n\n• Units WITHOUT a Central Idea + Lines of Inquiry are SKIPPED (the prompt has nothing to anchor on)\n• data.json will be snapshotted to Drive first (rollback path)\n• Early-years units (3YO, 4YO, Prep) get hands-on + screen-free emphasis\n• 4 units per batch, a few minutes per batch\n• Estimated total: 25-35 min\n• Progress shows in the Maintenance box; safe to leave running\n\nProceed?`)) return;
 
-  const btn = document.getElementById('btn-inspire-all');
-  const statusEl = document.getElementById('inspire-all-status');
-  if(btn){ btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = '✨ Running…'; }
+  const statusEl = maintStatusEl_();
+  maintJobStart_(true);
   let batchNum = 0;
   let totalFixed = 0;
   let totalFailed = 0;
@@ -987,7 +1129,7 @@ async function inspireAllBatch(){
       const secs = Math.floor((Date.now() - t0) / 1000);
       const mm = String(Math.floor(secs / 60)).padStart(1, '0');
       const ss = String(secs % 60).padStart(2, '0');
-      statusEl.textContent = `${label} — ${mm}:${ss} elapsed (each batch takes ~1-3 min)`;
+      statusEl.textContent = `${label}, ${mm}:${ss} elapsed (each batch takes ~1-3 min)`;
     };
     tick();
     heartbeatTimer = setInterval(tick, 1000);
@@ -997,7 +1139,7 @@ async function inspireAllBatch(){
   try {
     while(true){
       batchNum++;
-      const firstBatchHint = batchNum === 1 ? ' (first batch also snapshots data.json — ~30s extra)' : '';
+      const firstBatchHint = batchNum === 1 ? ' (first batch also snapshots data.json, ~30s extra)' : '';
       startHeartbeat(`Batch ${batchNum} running${firstBatchHint}`);
       setStatus(`Inspire All: batch ${batchNum} processing…`, 'loading');
       // batch=4 keeps each backend call well under Apps Script's hard 6-min
@@ -1006,8 +1148,6 @@ async function inspireAllBatch(){
       // + save + push). batch=8 was hitting the 360s wall and the fetch timed
       // out client-side at 369s after the runtime severed the connection.
       const payload = withGASToken({ action: 'regenerateAllInspiring', batch: 4 });
-      if(ca) payload.ca = ca;
-      if(yr) payload.yl = yr;
       const response = await fetch(SCRIPT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -1017,16 +1157,17 @@ async function inspireAllBatch(){
       stopHeartbeat();
       if(result.error){
         setStatus('Inspire All error: ' + result.error, 'error');
-        if(statusEl) statusEl.textContent = 'Failed: ' + result.error + ' — partial progress saved. Click Inspire All again to resume.';
+        if(statusEl) statusEl.textContent = 'Failed: ' + result.error + ', partial progress saved. Click Inspire All again to resume.';
         return;
       }
       if(result.paused){
         const isAbort = result.reason === 'aborted' || result.aborted === true;
         const msg = isAbort
-          ? 'Inspire All stopped by abort flag. Click "Clear abort flag" before resuming.'
+          ? 'Inspire All stopped by abort flag. Click "Clear abort" before resuming.'
           : 'Inspire All paused: ' + (result.reason || 'unknown') + (result.until ? ' until ' + result.until : '');
         setStatus(msg, isAbort ? 'success' : 'error');
-        if(statusEl) statusEl.textContent = isAbort ? 'Stopped by abort flag. Use "Clear abort flag" before resuming.' : `Paused (${result.reason || 'unknown'}${result.until ? ' until ' + result.until : ''}). Click Inspire All again to resume.`;
+        if(isAbort) maintSetAborted_(true);
+        if(statusEl) statusEl.textContent = isAbort ? 'Stopped by abort flag. Use "Clear abort" before resuming.' : `Paused (${result.reason || 'unknown'}${result.until ? ' until ' + result.until : ''}). Click Inspire All again to resume.`;
         return;
       }
       totalFixed += result.fixed || 0;
@@ -1034,13 +1175,13 @@ async function inspireAllBatch(){
       if(Array.isArray(result.failures)) allFailures.push(...result.failures);
       const snapNote = result.snapshot && !result.snapshot.alreadyExisted ? ` · snapshot: ${result.snapshot.snapshotName}` : '';
       const skipNote = result.skippedCount ? ` · ${result.skippedCount} skipped (no CI/LOI)` : '';
-      if(statusEl) statusEl.textContent = `Batch ${batchNum} done — ${result.done}/${result.total} eligible units regenerated, ${result.remaining} remaining${skipNote}${snapNote}`;
+      if(statusEl) statusEl.textContent = `Batch ${batchNum} done, ${result.done}/${result.total} eligible units regenerated, ${result.remaining} remaining${skipNote}${snapNote}`;
       setStatus(`Inspire All: ${result.done}/${result.total} done (batch ${batchNum})`, 'success');
       if(result.allDone){
-        const failNote = totalFailed > 0 ? ` (${totalFailed} failed — see console)` : '';
+        const failNote = totalFailed > 0 ? ` (${totalFailed} failed, see console)` : '';
         const skipMsg = result.skippedCount ? ` · ${result.skippedCount} skipped (need CI + LOI in the planner)` : '';
         setStatus(`✨ Inspire All complete: ${totalFixed} regenerated${failNote}${skipMsg}`, 'success');
-        if(statusEl) statusEl.textContent = `Complete — ${totalFixed} regenerated${failNote}${skipMsg}. Reload data to see the new descriptions.`;
+        if(statusEl) statusEl.textContent = `Complete, ${totalFixed} regenerated${failNote}${skipMsg}. Reload data to see the new descriptions.`;
         if(allFailures.length) console.warn('Inspire All failures:', allFailures);
         if(Array.isArray(result.skipped) && result.skipped.length) console.info('Inspire All skipped (no CI/LOI):', result.skipped);
         // Reload data so the new descriptions appear in the Studio.
@@ -1056,16 +1197,16 @@ async function inspireAllBatch(){
   } catch(err){
     stopHeartbeat();
     setStatus('Inspire All failed: ' + err.message, 'error');
-    if(statusEl) statusEl.textContent = 'Failed: ' + err.message + ' — partial progress saved. Click Inspire All again to resume.';
+    if(statusEl) statusEl.textContent = 'Failed: ' + err.message + ', partial progress saved. Click Inspire All again to resume.';
   } finally {
     stopHeartbeat();
-    if(btn){ btn.disabled = false; btn.style.opacity = '1'; btn.textContent = '🚀 Inspire all' + (ca || yr ? ' (in view)' : ''); }
+    maintJobEnd_(true);
   }
 }
 
 // 2026-05-27: Client-side mirror of inspiringFindUnitsWithAppSmashes_ —
 // counts units whose slots 1-5 contain any "+" in t. Used to gate +
-// label the Sweep button on the Inspire All card. Slot 6 (STEM) is
+// label the Sweep button in the Maintenance box. Slot 6 (STEM) is
 // intentionally excluded; it was never an App Smash slot.
 //
 // Note: uses bare `DATA` (the top-level `let` in 00-config-state-utils.js),
@@ -1092,15 +1233,14 @@ function findAppSmashUnitsLocal_(){
 async function sweepAppSmashesBatch(){
   const targets = findAppSmashUnitsLocal_();
   if(!targets.length){
-    alert('No App Smash units found — every unit already uses single-tool suggestions.');
+    alert('No App Smash units found. Every unit already uses single-tool suggestions.');
     return;
   }
   const estMin = Math.max(1, Math.ceil(targets.length / 4 * 1.5));
-  if(!confirm(`Regenerate ${targets.length} unit${targets.length===1?'':'s'} still holding "+" App Smash suggestions?\n\n• Every "+" suggestion becomes a single-tool 6-sentence suggestion in the inspiring style.\n• Routed through the same regenerateAllInspiring pipeline as Inspire All — resumable if your laptop sleeps.\n• ~4 units per batch, ~1-3 min per batch.\n• Estimated total: ~${estMin} min.\n• Progress shows on the ✨ card; safe to leave running.\n\nProceed?`)) return;
+  if(!confirm(`Regenerate ${targets.length} unit${targets.length===1?'':'s'} still holding "+" App Smash suggestions?\n\n• Every "+" suggestion becomes a single-tool 6-sentence suggestion in the inspiring style.\n• Routed through the same pipeline as Inspire All, and resumable if your laptop sleeps.\n• About 4 units per batch, 1-3 min per batch.\n• Estimated total: about ${estMin} min.\n• Progress shows in the Maintenance box; safe to leave running.\n\nProceed?`)) return;
 
-  const btn = document.getElementById('btn-sweep-appsmashes');
-  const statusEl = document.getElementById('inspire-all-status');
-  if(btn){ btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = '🔥 Sweeping…'; }
+  const statusEl = maintStatusEl_();
+  maintJobStart_(true);
   let batchNum = 0;
   let totalFixed = 0;
   let totalFailed = 0;
@@ -1114,7 +1254,7 @@ async function sweepAppSmashesBatch(){
       const secs = Math.floor((Date.now() - t0) / 1000);
       const mm = String(Math.floor(secs / 60)).padStart(1, '0');
       const ss = String(secs % 60).padStart(2, '0');
-      statusEl.textContent = `${label} — ${mm}:${ss} elapsed (each batch takes ~1-3 min)`;
+      statusEl.textContent = `${label}, ${mm}:${ss} elapsed (each batch takes ~1-3 min)`;
     };
     tick();
     heartbeatTimer = setInterval(tick, 1000);
@@ -1124,7 +1264,7 @@ async function sweepAppSmashesBatch(){
   try {
     while(true){
       batchNum++;
-      const firstBatchHint = batchNum === 1 ? ' (first batch also snapshots data.json — ~30s extra)' : '';
+      const firstBatchHint = batchNum === 1 ? ' (first batch also snapshots data.json, ~30s extra)' : '';
       startHeartbeat(`Sweep batch ${batchNum} running${firstBatchHint}`);
       setStatus(`App Smash sweep: batch ${batchNum} processing…`, 'loading');
       const payload = withGASToken({ action: 'regenerateAllInspiringSweepAppSmashes', batch: 4 });
@@ -1137,27 +1277,28 @@ async function sweepAppSmashesBatch(){
       stopHeartbeat();
       if(result.error){
         setStatus('Sweep error: ' + result.error, 'error');
-        if(statusEl) statusEl.textContent = 'Failed: ' + result.error + ' — partial progress saved. Click Sweep again to resume.';
+        if(statusEl) statusEl.textContent = 'Failed: ' + result.error + ', partial progress saved. Click Sweep again to resume.';
         return;
       }
       if(result.paused){
         const isAbort = result.reason === 'aborted' || result.aborted === true;
         const msg = isAbort
-          ? 'Sweep stopped by abort flag. Click "Clear abort flag" before resuming.'
+          ? 'Sweep stopped by abort flag. Click "Clear abort" before resuming.'
           : 'Sweep paused: ' + (result.reason || 'unknown') + (result.until ? ' until ' + result.until : '');
         setStatus(msg, isAbort ? 'success' : 'error');
-        if(statusEl) statusEl.textContent = isAbort ? 'Stopped by abort flag. Use "Clear abort flag" before resuming.' : `Paused (${result.reason || 'unknown'}${result.until ? ' until ' + result.until : ''}). Click Sweep again to resume.`;
+        if(isAbort) maintSetAborted_(true);
+        if(statusEl) statusEl.textContent = isAbort ? 'Stopped by abort flag. Use "Clear abort" before resuming.' : `Paused (${result.reason || 'unknown'}${result.until ? ' until ' + result.until : ''}). Click Sweep again to resume.`;
         return;
       }
       totalFixed += result.fixed || 0;
       totalFailed += result.failed || 0;
       if(Array.isArray(result.failures)) allFailures.push(...result.failures);
-      if(statusEl) statusEl.textContent = `Sweep batch ${batchNum} done — ${result.done || totalFixed}/${result.total || targets.length} swept`;
+      if(statusEl) statusEl.textContent = `Sweep batch ${batchNum} done, ${result.done || totalFixed}/${result.total || targets.length} swept`;
       setStatus(`App Smash sweep: ${result.done || totalFixed}/${result.total || targets.length} done (batch ${batchNum})`, 'success');
       if(result.allDone){
-        const failNote = totalFailed > 0 ? ` (${totalFailed} failed — see console)` : '';
+        const failNote = totalFailed > 0 ? ` (${totalFailed} failed, see console)` : '';
         setStatus(`🔥 App Smash sweep complete: ${totalFixed} regenerated${failNote}`, 'success');
-        if(statusEl) statusEl.textContent = `Sweep complete — ${totalFixed} regenerated${failNote}. Reloading data…`;
+        if(statusEl) statusEl.textContent = `Sweep complete, ${totalFixed} regenerated${failNote}. Reloading data…`;
         if(allFailures.length) console.warn('App Smash sweep failures:', allFailures);
         if(typeof loadFromDrive === 'function'){
           await loadFromDrive();
@@ -1170,84 +1311,10 @@ async function sweepAppSmashesBatch(){
   } catch(err){
     stopHeartbeat();
     setStatus('Sweep failed: ' + err.message, 'error');
-    if(statusEl) statusEl.textContent = 'Failed: ' + err.message + ' — partial progress saved. Click Sweep again to resume.';
+    if(statusEl) statusEl.textContent = 'Failed: ' + err.message + ', partial progress saved. Click Sweep again to resume.';
   } finally {
     stopHeartbeat();
-    if(btn){ btn.disabled = false; btn.style.opacity = '1'; btn.textContent = `🔥 Sweep App Smashes (${findAppSmashUnitsLocal_().length})`; }
-  }
-}
-
-// 2026-05-25: First Inspire All run leaked off-whitelist + banned tools at
-// temperature 0.75 because the inherited validator didn't check the tool
-// list. The backend now hard-validates approved/banned membership. This
-// helper finds any units the first run wrote with rogue tools and clears
-// their inspiringRegenAt so Inspire All redoes ONLY those.
-async function inspireAllRequeueBadTools(){
-  const ca = document.getElementById('f-campus')?.value || '';
-  const yr = document.getElementById('f-year')?.value || '';
-  const scopeLabel = ca || yr ? ` for ${[ca, yr].filter(Boolean).join(' · ')}` : '';
-  setStatus('Scanning for off-whitelist / banned tools…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'regenerateAllInspiringRequeueBadTools' });
-    if(ca) payload.ca = ca;
-    if(yr) payload.yl = yr;
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Requeue error: ' + result.error, 'error'); return; }
-    if(!result.found){
-      setStatus(`No off-whitelist or banned tools found${scopeLabel}.`, 'success');
-      return;
-    }
-    setStatus(`Cleared inspiringRegenAt on ${result.cleared} unit(s) with rogue tools — click Inspire All to redo them`, 'success');
-    console.info(`Inspire All bad-tool units (${result.found}):`, result.units);
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-    if(confirm(`Found ${result.found} unit(s) with off-whitelist or banned tools (cleared their flags). Click OK to start Inspire All now and regenerate them with the tightened validator. The full list is in the browser console.`)){
-      inspireAllBatch();
-    }
-  } catch(err){
-    setStatus('Requeue failed: ' + err.message, 'error');
-  }
-}
-
-// 2026-05-27: Companion to inspireAllRequeueBadTools — scans every
-// inspired unit's slot DESCRIPTIONS for off-whitelist tool name mentions
-// (Clips iOS, Microsoft Sway, Notability, etc.) and clears their
-// inspiringRegenAt markers so Inspire All redoes just those. Catches the
-// gap where the t-field is approved but the description name-drops an
-// unapproved tool ("use the iPad camera and Clips app...").
-async function inspireAllRequeueBadDescriptions(){
-  setStatus('Scanning descriptions for off-whitelist tool mentions…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'regenerateAllInspiringRequeueBadDescriptions' });
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Requeue error: ' + result.error, 'error'); return; }
-    if(!result.cleared){
-      setStatus('No description-side off-whitelist mentions found.', 'success');
-      return;
-    }
-    setStatus(`Cleared inspiringRegenAt on ${result.cleared} unit(s) with rogue tool mentions in descriptions — click Inspire All to redo them`, 'success');
-    console.info('Inspire All bad-description units:', result.units);
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-    if(confirm(`Found ${result.cleared} unit(s) with off-whitelist tool names buried in their descriptions (Clips app, Sway, Notability, etc.). Markers cleared. Click OK to start Inspire All now and regenerate them under the new prompt that rejects these. Full list is in the browser console.`)){
-      inspireAllBatch();
-    }
-  } catch(err){
-    setStatus('Requeue failed: ' + err.message, 'error');
+    maintJobEnd_(true);
   }
 }
 
@@ -1257,7 +1324,7 @@ async function inspireAllRequeueBadDescriptions(){
 // and stops. Must be explicitly cleared (via Clear abort button) before
 // future runs can proceed.
 async function inspireAllAbort(){
-  if(!confirm('Emergency STOP all Inspire All activity?\n\n• Stops the current batch (and any queued batches) at the next unit boundary\n• Already-saved progress stays\n• Blocks future Inspire All runs until you click "Clear abort flag"\n\nProceed?'))return;
+  if(!confirm('Emergency STOP for Inspire All and the App Smash sweep?\n\n• Stops the current batch (and any queued batches) at the next unit\n• Already-saved progress stays\n• Blocks future runs until you click "Clear abort" in the Maintenance box\n\nProceed?'))return;
   try {
     const payload = withGASToken({ action: 'regenerateAllInspiringAbort' });
     const response = await fetch(SCRIPT_URL, {
@@ -1267,98 +1334,11 @@ async function inspireAllAbort(){
     });
     const result = await response.json();
     if(result.error){ setStatus('Abort error: ' + result.error, 'error'); return; }
-    setStatus('🛑 Inspire All abort flag set — current batch will stop at the next unit. Future runs blocked until cleared.', 'success');
-    if(typeof renderBrowse === 'function') renderBrowse();
+    setStatus('Stop requested. The current batch will stop at the next unit. Future runs are blocked until cleared.', 'success');
+    maintStatus_('Stop requested. The current batch will stop at the next unit.');
+    renderMaintenanceBox();
   } catch(err){
     setStatus('Abort failed: ' + err.message, 'error');
-  }
-}
-
-// 2026-05-25: Requeue any unit whose tools were auto-substituted, so
-// Inspire All can produce fresh descriptions tailored to the new
-// tools (rather than the mechanical rename, which can leave feature-
-// specific language mismatched).
-async function inspireAllRequeueAutoSwapped(){
-  if(!confirm('Clear the inspiringRegenAt marker on every unit whose tools were auto-substituted, then offer to regenerate them with the AI?\n\n• Lets Inspire All produce FRESH descriptions tailored to the replacement tools\n• Fixes feature-mismatch language left over from the rename ("Flipgrid\'s grid-style feed" -> properly Seesaw-flavoured prose)\n• Also catches any duplicates the auto-fix introduced (the AI validator rejects intra-unit dups)\n• Costs OpenAI fees for those units only\n\nProceed?'))return;
-  setStatus('Requeuing auto-swapped units…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'regenerateAllInspiringRequeueAutoSwapped' });
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Requeue error: ' + result.error, 'error'); return; }
-    if(!result.found){
-      setStatus('No auto-swapped units found — nothing to requeue.', 'success');
-      return;
-    }
-    setStatus(`Cleared inspiringRegenAt on ${result.cleared} auto-swapped unit(s).`, 'success');
-    console.info(`Auto-swapped units (${result.found}):`, result.units);
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-    if(confirm(`Requeued ${result.cleared} unit(s). Start Inspire All now to regenerate them with the AI?`)){
-      inspireAllBatch();
-    }
-  } catch(err){
-    setStatus('Requeue failed: ' + err.message, 'error');
-  }
-}
-
-// 2026-05-26: Surgical zero-AI dedup. For every unit with two slots
-// sharing the exact same `t` field string, renames the second
-// occurrence to the first approved fallback that's not already used
-// in the unit (and not equal to the duplicate). Best-effort rewrite
-// of description text to match. Verified locally to take 45 dups -> 0.
-async function inspireAllDedupExactStrings(){
-  if(!confirm('Surgically rename slots that have an exact-string duplicate of another slot in the same unit (e.g. two slots both reading "Seesaw")?\n\n• Picks the next available approved tool from the fallback chain that\'s NOT already in the unit\n• Best-effort: also rewrites the description text to match the new tool name\n• No OpenAI calls\n• Tested against the live data.json — produces zero duplicate audit hits\n\nProceed?'))return;
-  setStatus('Deduping exact-string duplicates…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'inspiringDedupExactStrings' });
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Dedup error: ' + result.error, 'error'); return; }
-    setStatus(`✓ Dedup renamed ${result.renamed} duplicate slot(s) across ${Array.isArray(result.units)?result.units.length:0} unit(s).`, 'success');
-    if(Array.isArray(result.units) && result.units.length) console.info('Dedup details:', result.units);
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-  } catch(err){
-    setStatus('Dedup failed: ' + err.message, 'error');
-  }
-}
-
-// 2026-05-25: Zero-AI direct fix. Scans all units, renames any rogue
-// tool slot to an approved equivalent via the backend substitution
-// map. No OpenAI calls; descriptions are untouched.
-async function inspireAllAutoFixBadTools(){
-  if(!confirm('Auto-fix every unit whose suggestions contain off-whitelist, banned, or age-mismatched tool names?\n\n• The TOOL NAME in each affected slot will be swapped to an approved equivalent (e.g. Flipgrid -> Seesaw)\n• The description text is UNTOUCHED — it may still reference the original tool by name in the prose\n• No OpenAI calls; this is purely a rename pass\n\nProceed?'))return;
-  setStatus('Auto-fixing rogue tool names…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'inspiringAutoFixBadTools' });
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Auto-fix error: ' + result.error, 'error'); return; }
-    setStatus(`✓ Auto-fixed ${result.fixed} unit(s) with rogue tool names. Descriptions untouched.`, 'success');
-    if(Array.isArray(result.fixes) && result.fixes.length) console.info('Auto-fix details:', result.fixes);
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-  } catch(err){
-    setStatus('Auto-fix failed: ' + err.message, 'error');
   }
 }
 
@@ -1373,8 +1353,9 @@ async function inspireAllClearAbort(){
     });
     const result = await response.json();
     if(result.error){ setStatus('Clear-abort error: ' + result.error, 'error'); return; }
-    setStatus('Abort flag cleared — Inspire All can resume.', 'success');
-    if(typeof renderBrowse === 'function') renderBrowse();
+    setStatus('Abort flag cleared. Inspire All can resume.', 'success');
+    maintStatus_('Abort cleared. You can run the jobs again.');
+    maintSetAborted_(false);
   } catch(err){
     setStatus('Clear-abort failed: ' + err.message, 'error');
   }
@@ -1414,7 +1395,21 @@ async function approveUoiProposal(id){
       body: JSON.stringify(payload)
     });
     const result = await response.json();
-    if(result.error){ setStatus('Approve error: ' + result.error, 'error'); return; }
+    if(result.error){
+      setStatus('Approve error: ' + result.error, 'error');
+      if(/already (approved|dismissed)/.test(String(result.error))) await loadUoiProposals();
+      return;
+    }
+    if(result.proposalStatusSaved === false){
+      await loadUoiProposals();
+      if(typeof loadFromDrive === 'function'){
+        await loadFromDrive();
+        if(typeof renderBrowse === 'function') renderBrowse();
+      }
+      // Shown last so the reload above does not replace it.
+      setStatus('The unit was updated, but the proposal list could not be marked as approved. Please refresh the list; do not approve it again.', 'error');
+      return;
+    }
     setStatus(`✓ Approved — ${result.changes ? result.changes.length : 0} field(s) updated. ${result.ideasGenerated ? '6 lesson ideas generated and published.' : 'Ideas not generated (needs both Central Idea and Lines of Inquiry) — run Inspire All when ready.'}`, 'success');
     await loadUoiProposals();
     if(typeof loadFromDrive === 'function'){
@@ -1451,61 +1446,6 @@ if(typeof window !== 'undefined'){
     document.addEventListener('DOMContentLoaded', function(){ setTimeout(loadUoiProposals, 1500); });
   } else {
     setTimeout(loadUoiProposals, 1500);
-  }
-}
-
-async function inspireAllReset(){
-  const ca = document.getElementById('f-campus')?.value || '';
-  const yr = document.getElementById('f-year')?.value || '';
-  const scopeLabel = ca || yr ? ` for ${[ca, yr].filter(Boolean).join(' · ')}` : ' for ALL units';
-  if(!confirm(`Reset the Inspire All flags${scopeLabel}? Next run will reprocess every unit from scratch (and create a fresh data.json snapshot). Existing suggestions stay until the regen overwrites them. Proceed?`)) return;
-  setStatus('Resetting Inspire All flags…', 'loading');
-  try {
-    const payload = withGASToken({ action: 'regenerateAllInspiringReset' });
-    if(ca) payload.ca = ca;
-    if(yr) payload.yl = yr;
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Reset error: ' + result.error, 'error'); return; }
-    setStatus(`Cleared inspire flags on ${result.cleared || 0} unit(s)`, 'success');
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-  } catch(err){
-    setStatus('Reset failed: ' + err.message, 'error');
-  }
-}
-
-async function resetMakerspaceFlagsBatch(){
-  const ca = document.getElementById('browse-campus')?.value || '';
-  const yr = document.getElementById('browse-year')?.value || '';
-  const scopeLabel = ca || yr ? ` (${[ca, yr].filter(Boolean).join(' · ')})` : '';
-  if(!confirm(`Reset the Makerspace reboot flags for entries${scopeLabel}? This lets you re-run the reboot from scratch — existing #6 suggestions stay until reboot is run again.`)) return;
-
-  setStatus(`Resetting reboot flags${scopeLabel}…`, 'loading');
-  try {
-    const payload = withGASToken({ action: 'resetMakerspaceFlags' });
-    if(ca) payload.filterCa = ca;
-    if(yr) payload.filterYl = yr;
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
-    if(result.error){ setStatus('Reset error: ' + result.error, 'error'); return; }
-    setStatus(result.message || `Reset ${result.reset || 0} flags`, 'success');
-    if(typeof loadFromDrive === 'function'){
-      await loadFromDrive();
-      if(typeof renderBrowse === 'function') renderBrowse();
-    }
-  } catch(err) {
-    setStatus('Reset failed: ' + err.message, 'error');
   }
 }
 
@@ -1562,116 +1502,12 @@ function renderBrowse(){
   const remainingCount = Math.max(0, DATA.length - totalVerifiedCount);
   document.getElementById('browse-count').textContent=`${filtered.length} entries · ${verifiedCount} human verified in view`;
 
-  // v5.20: Makerspace Reboot summary — counts how many filtered entries have a refreshed makerspace project
-  const filteredAudited = filtered.filter(({e}) => e.audited && Array.isArray(e.s) && e.s.length >= 5);
-  const filteredRebooted = filteredAudited.filter(({e}) => e.stemRebooted === true).length;
-  const filteredAuditedTotal = filteredAudited.length;
-  const filteredRebootRemaining = filteredAuditedTotal - filteredRebooted;
-  const scopeLabel = ca || yr ? `in view (${[ca, yr].filter(Boolean).join(' · ')})` : 'across all units';
-  const makerspaceSummaryHtml = filteredAuditedTotal > 0 ? `<div class="card2" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;border-color:rgba(167,139,250,.35);background:rgba(167,139,250,.06)">
-    <span style="font-size:18px">🛠</span>
-    <span style="font-size:13px;color:var(--text);font-weight:800">${filteredRebooted}/${filteredAuditedTotal} makerspace projects rebooted ${scopeLabel}</span>
-    <span style="font-size:12px;color:var(--dim)">${filteredRebootRemaining > 0 ? `${filteredRebootRemaining} still using the original generated #6 suggestion` : 'All makerspace projects refreshed with catchy hands-on titles'}</span>
-    ${filteredRebootRemaining > 0 ? `<button onclick="rebootMakerspaceBatch()" style="margin-left:auto;padding:6px 14px;background:#A78BFA;color:#111;border:none;border-radius:8px;font-weight:800;font-size:12px;cursor:pointer" title="Replace the 6th (Makerspace) suggestion with a new catchy hands-on physical project. Processes 4 at a time.">Reboot makerspace${ca || yr ? ' (in view)' : ''}</button>` : ''}
-    ${filteredRebooted > 0 ? `<button onclick="resetMakerspaceFlagsBatch()" style="padding:6px 12px;background:transparent;border:1px solid rgba(255,128,128,.3);color:#FF8080;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Clear the rebooted flag so you can re-run the makerspace reboot from scratch">Reset reboot flags</button>` : ''}
-  </div>` : '';
-
   const verificationSummaryHtml = `<div class="card2" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-color:${remainingCount ? 'rgba(212,160,23,.35)' : 'rgba(197,232,74,.4)'};background:${remainingCount ? 'rgba(212,160,23,.06)' : 'rgba(197,232,74,.08)'}">
     <span class="human-verified-tick" style="margin-left:0">✓ Human verified audit</span>
     <span style="font-size:13px;color:var(--text);font-weight:800">${totalVerifiedCount}/${DATA.length} units checked</span>
     <span style="font-size:12px;color:var(--dim)">${remainingCount ? `${remainingCount} still need a human check` : 'All units have been human verified'}</span>
     ${totalVerifiedCount > 0 ? `<button onclick="removeAllHumanVerified()" style="margin-left:auto;padding:5px 12px;background:transparent;border:1px solid rgba(255,128,128,0.3);color:#FF8080;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Clear all human verification flags so you can re-verify from scratch">Reset all verified</button>` : ''}
   </div>`;
-
-  // 2026-05-25: "Inspire All" card — bulk 6-sentence regen across every unit
-  // that has both Central Idea (ci) and Lines of Inquiry (lo). Units missing
-  // either anchor are counted separately as "skipped" so teachers know what
-  // to fill in manually before re-running. Counts units already touched by
-  // the inspiringRegenAt marker so the card doubles as a progress display
-  // while the looping runner is mid-flight.
-  const inspireHasDetails = (e) => !!(e && e.ci && String(e.ci).trim() && e.lo && String(e.lo).trim());
-  const inspireEligible = filtered.filter(({e}) => inspireHasDetails(e));
-  const inspireSkipped = filtered.filter(({e}) => !inspireHasDetails(e));
-  const filteredInspired = inspireEligible.filter(({e}) => e.inspiringRegenAt).length;
-  const filteredInspiredTotal = inspireEligible.length;
-  const inspiredRemaining = filteredInspiredTotal - filteredInspired;
-  const inspireScopeLabel = ca || yr ? `(${[ca, yr].filter(Boolean).join(' · ')})` : 'across all 3 campuses';
-  const inspireSkippedTitle = inspireSkipped.length ? inspireSkipped.map(({e}) => {
-    const m = [];
-    if(!e.ci || !String(e.ci).trim()) m.push('CI');
-    if(!e.lo || !String(e.lo).trim()) m.push('LOI');
-    return `${e.ca} · ${e.yl} · ${e.th} (missing ${m.join(' + ')})`;
-  }).join('\n') : '';
-  const inspireSkippedNote = inspireSkipped.length ? ` · <span style="color:#fbbf24;cursor:help" title="${esc(inspireSkippedTitle)}">${inspireSkipped.length} skipped (no CI/LOI)</span>` : '';
-  // 2026-05-27: App Smash sweep button — appears whenever any unit
-  // still has a "+" in slots 1-5. Routes through the same
-  // regenerateAllInspiring batch infrastructure as Inspire All.
-  const _appSmashTargets = (typeof findAppSmashUnitsLocal_ === 'function') ? findAppSmashUnitsLocal_() : [];
-  const sweepButtonHtml = _appSmashTargets.length
-    ? `<button id="btn-sweep-appsmashes" onclick="sweepAppSmashesBatch()" style="padding:6px 14px;background:#F97316;color:#1a0e00;border:none;border-radius:8px;font-weight:800;font-size:12px;cursor:pointer" title="Regenerate every unit still holding a '+' App Smash suggestion. One-time sweep — routed through regenerateAllInspiring with the new single-tool prompt.">🔥 Sweep App Smashes (${_appSmashTargets.length})</button>`
-    : '';
-  // 2026-05-25: Card is now state-aware. When everything's clean (all
-  // eligible units regenerated, no abort flag, no skipped units in this
-  // view) we collapse to a tiny ✓ status line with an "Advanced" dropdown
-  // for the recovery / re-regen / reset / STOP controls. When there's
-  // work to do we show only the buttons relevant to the current state,
-  // not all 6 at once.
-  const _inspireBusy = inspiredRemaining > 0;
-  const _hasSkipped = inspireSkipped.length > 0;
-  const _isClean = !_inspireBusy && filteredInspiredTotal > 0;
-  const _advancedToggleId = 'inspire-advanced-toggle';
-  const _advancedBodyId = 'inspire-advanced-body';
-  const _advancedButtons = `
-    <div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:10px;margin-top:10px;border-top:1px solid rgba(255,255,255,.05)">
-      <button onclick="inspireAllAutoFixBadTools()" style="padding:6px 12px;background:transparent;border:1px solid #FBBF24;color:#FBBF24;border-radius:8px;font-weight:700;font-size:11px;cursor:pointer" title="Scan every unit for off-whitelist / banned / age-mismatched tool names and rename them to approved equivalents in-place. Also rewrites the tool name in the description text. No OpenAI calls. Spot-review affected units (inspiringRegenAutoSwapped is set).">🪄 Auto-fix bad tools (no AI)</button>
-      <button onclick="inspireAllDedupExactStrings()" style="padding:6px 12px;background:transparent;border:1px solid #4ADE80;color:#4ADE80;border-radius:8px;font-weight:700;font-size:11px;cursor:pointer" title="Surgical dedup: rename slots where the t field exactly matches another slot in the same unit (e.g. two Seesaws). Picks the next available approved tool from the fallback chain. No OpenAI calls. Tested locally to fix 100% of exact-string duplicates in one pass.">🧹 Dedup exact strings (no AI)</button>
-      <button onclick="inspireAllRequeueAutoSwapped()" style="padding:6px 12px;background:transparent;border:1px solid #A78BFA;color:#A78BFA;border-radius:8px;font-weight:700;font-size:11px;cursor:pointer" title="Clear inspiringRegenAt on every auto-swapped unit so Inspire All can produce fresh descriptions tailored to the substituted tools (fixes feature-mismatch language + any duplicates the auto-fix introduced).">🎯 Re-regen auto-swapped (AI)</button>
-      <button onclick="inspireAllRequeueBadTools()" style="padding:6px 12px;background:transparent;border:1px solid #FBBF24;color:#FBBF24;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Scan for bad-tool units, clear their inspiringRegenAt, and offer to redo just those with the AI (more expensive but produces fresh descriptions).">🔍 Re-regen with AI</button>
-      <button onclick="inspireAllRequeueBadDescriptions()" style="padding:6px 12px;background:transparent;border:1px solid #F97316;color:#F97316;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Scan slot DESCRIPTIONS for off-whitelist tool names (Clips iOS app, Microsoft Sway, Notability, iMotion, Keynote, Flipgrid, WeVideo, Google Slides, OneNote). Word-bounded so common phrases like 'video clips' don't false-positive. Clears their inspiringRegenAt and lets you click Inspire All to redo only those.">📝 Re-regen for bad description tools</button>
-      <button onclick="inspireAllAbort()" style="padding:6px 12px;background:transparent;border:1px solid #DC2626;color:#DC2626;border-radius:8px;font-weight:700;font-size:11px;cursor:pointer" title="EMERGENCY STOP: stops any in-flight Inspire All batch at the next unit boundary and blocks future runs until cleared.">🛑 STOP</button>
-      <button onclick="inspireAllClearAbort()" style="padding:6px 12px;background:transparent;border:1px solid #888;color:#888;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Clear the backend abort flag so Inspire All can run again.">Clear abort</button>
-      <button onclick="inspireAllReset()" style="padding:6px 12px;background:transparent;border:1px solid rgba(255,128,128,.3);color:#FF8080;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer" title="Clear the inspiringRegenAt flag on EVERY unit so Inspire All can be re-run from scratch.">Reset inspire flags</button>
-    </div>`;
-
-  let inspireSummaryHtml = '';
-  if(_isClean){
-    // Clean state: one row, one button. Advanced controls hidden behind toggle.
-    inspireSummaryHtml = `<div id="inspire-all-card" class="card2" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;border-color:rgba(74,222,128,.3);background:rgba(74,222,128,.05)">
-      <span style="font-size:16px">✨</span>
-      <span style="font-size:13px;color:var(--text);font-weight:800">${filteredInspired}/${filteredInspiredTotal} units in 6-sentence inspiring style ${inspireScopeLabel}${inspireSkippedNote}</span>
-      <span style="font-size:11px;color:#4ADE80;letter-spacing:.4px">✓ Complete</span>
-      ${sweepButtonHtml ? `<span id="inspire-all-status" style="font-size:12px;color:var(--dim);margin-left:auto"></span>${sweepButtonHtml}` : ''}
-      <button id="${_advancedToggleId}" onclick="document.getElementById('${_advancedBodyId}').style.display=document.getElementById('${_advancedBodyId}').style.display==='none'?'block':'none';this.textContent=document.getElementById('${_advancedBodyId}').style.display==='none'?'⚙ Advanced':'⚙ Hide';" style="${sweepButtonHtml ? '' : 'margin-left:auto;'}padding:5px 10px;background:transparent;border:1px solid #555;color:#888;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer">⚙ Advanced</button>
-      <div id="${_advancedBodyId}" style="flex:1 1 100%;display:none">${_advancedButtons}</div>
-    </div>`;
-  } else if(_inspireBusy){
-    // Mid-progress: show the primary action + Advanced toggle.
-    inspireSummaryHtml = `<div id="inspire-all-card" class="card2" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;border-color:rgba(56,189,248,.35);background:rgba(56,189,248,.06)">
-      <span style="font-size:18px">✨</span>
-      <span style="font-size:13px;color:var(--text);font-weight:800">${filteredInspired}/${filteredInspiredTotal} units regenerated ${inspireScopeLabel}${inspireSkippedNote}</span>
-      <span id="inspire-all-status" style="font-size:12px;color:var(--dim)">${inspiredRemaining} remaining</span>
-      <button id="btn-inspire-all" onclick="inspireAllBatch()" style="margin-left:auto;padding:6px 14px;background:#38BDF8;color:#0a1f2e;border:none;border-radius:8px;font-weight:800;font-size:12px;cursor:pointer" title="Regenerate every unit's 6 suggestions in the new 6-sentence inspiring style. Snapshots data.json first. Processes 4 units per batch. Units missing Central Idea or Lines of Inquiry are SKIPPED. Validator rejects off-whitelist + banned + age-mismatched tools; auto-substitute fallback fires if AI can't comply after 3 retries.">🚀 Inspire all${ca || yr ? ' (in view)' : ''}</button>
-      ${sweepButtonHtml}
-      <button id="${_advancedToggleId}" onclick="document.getElementById('${_advancedBodyId}').style.display=document.getElementById('${_advancedBodyId}').style.display==='none'?'block':'none';this.textContent=document.getElementById('${_advancedBodyId}').style.display==='none'?'⚙ Advanced':'⚙ Hide';" style="padding:5px 10px;background:transparent;border:1px solid #555;color:#888;border-radius:8px;font-weight:600;font-size:11px;cursor:pointer">⚙ Advanced</button>
-      <div id="${_advancedBodyId}" style="flex:1 1 100%;display:none">${_advancedButtons}</div>
-    </div>`;
-  }
-
-  // 2026-05-27: Standalone App Smash sweep card. Fires when the main
-  // Inspire All card above didn't render (no eligible units in scope)
-  // but there are still legacy "+" units somewhere in the corpus that
-  // need cleaning up. Sweep targets ALL of DATA regardless of filter
-  // scope, so it's safe to show even when the user is filtered down
-  // to a slice that has no eligible units.
-  let sweepStandaloneHtml = '';
-  if(!inspireSummaryHtml && _appSmashTargets.length){
-    sweepStandaloneHtml = `<div id="sweep-appsmashes-card" class="card2" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;border-color:rgba(249,115,22,.35);background:rgba(249,115,22,.06)">
-      <span style="font-size:18px">🔥</span>
-      <span style="font-size:13px;color:var(--text);font-weight:800">${_appSmashTargets.length} unit${_appSmashTargets.length===1?'':'s'} still hold "+" App Smash suggestions across the whole corpus</span>
-      <span id="inspire-all-status" style="font-size:12px;color:var(--dim)">Click Sweep to regenerate them all in the new single-tool style</span>
-      ${sweepButtonHtml}
-    </div>`;
-  }
 
   // 2026-05-25: Teacher UOI edit proposals — admin review panel.
   // Loaded once on page init via loadUoiProposals (cached in
@@ -1682,7 +1518,7 @@ function renderBrowse(){
   );
   const proposalReviewHtml = uoiProposalsCardHtml(_proposalsScoped);
 
-  document.getElementById('browse-list').innerHTML=proposalReviewHtml + inspireSummaryHtml + sweepStandaloneHtml + makerspaceSummaryHtml + verificationSummaryHtml + filtered.map(({e,idx})=>{
+  document.getElementById('browse-list').innerHTML=proposalReviewHtml + verificationSummaryHtml + filtered.map(({e,idx})=>{
     const verified = isHumanVerifiedEntry_(e);
     const flash = window._lastHumanVerifiedIdx === idx ? ' human-verify-flash' : '';
     const meta = verified ? humanVerifiedMeta_(e) : '';
@@ -1709,15 +1545,7 @@ function renderEntry(idx){
   const entryHumanVerifiedMeta = entryHumanVerified ? humanVerifiedMeta_(e) : '';
   const entryHumanVerifiedBanner = entryHumanVerified ? `<div class="human-verified-entry-banner" title="${esc(entryHumanVerifiedMeta || 'Human verified')}">✓ Human verified${entryHumanVerifiedMeta ? ` · ${esc(entryHumanVerifiedMeta)}` : ''}</div>` : '';
   
-  const existingLock = isLocked(idx);
-  const lockBanner = existingLock && !isLockedByMe(idx)
-    ? `<div style="padding:8px 14px;background:rgba(251,191,36,0.15);border:1px solid #fbbf24;border-radius:8px;margin-bottom:10px;font-size:12px;color:#fbbf24;font-weight:600">
-        🔒 ${existingLock.user} is also editing this entry — coordinate before saving
-      </div>`
-    : `<div style="padding:6px 14px;background:rgba(197,232,74,0.08);border:1px solid rgba(197,232,74,0.2);border-radius:8px;margin-bottom:10px;font-size:11px;color:var(--lime)">
-        ✓ Locked by you — others will see this entry is in use
-      </div>`;
-  document.getElementById('entry-header').innerHTML=lockBanner+entryHumanVerifiedBanner+`
+  document.getElementById('entry-header').innerHTML=entryHumanVerifiedBanner+`
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:${(e.ci||e.lo||e.plannerText)?'16px':'0'}">
       <div>
         <h2 style="font-size:24px;font-weight:700;color:#fff;margin-bottom:6px">${esc(e.th)}</h2>
@@ -2437,8 +2265,8 @@ function confirmSugFeedback(entryIdx, sugIdx, uid, choiceIdx){
   DATA[entryIdx].s = sugs;
   DATA[entryIdx].audited = true;
   markEntryNeedsHumanRecheck_(entryIdx, 'Suggestion feedback edit applied after human verification');
-  saveToDrive();
-  setStatus('Suggestion updated and saved');
+  setStatus('Suggestion updated, saving to Drive…', 'loading');
+  saveToDrive().then(() => setStatus('Suggestion updated and saved')).catch(showSaveError_);
   delete window['_fbsugs_'+uid];
   delete window['_fbmem_'+uid];  // clear conversation memory after a successful apply
   document.getElementById(uid+'-chat')?.remove();
@@ -2606,8 +2434,8 @@ function applyRegenAll(idx,pendingId){
   markEntryNeedsHumanRecheck_(idx, 'Regenerated suggestions after human verification');
   delete window[pendingId];
   delete window['regenallSwap_'+idx];
-  setStatus('Saved');
-  saveToDrive();
+  setStatus('Saving to Drive…', 'loading');
+  saveToDrive().then(() => setStatus('Saved')).catch(showSaveError_);
   renderEntry(idx);
 }
 
@@ -2721,7 +2549,7 @@ function normaliseToolName(t){
     'word':'Microsoft Word','ms word':'Microsoft Word','office word':'Microsoft Word',
     'teams':'Microsoft Teams','ms teams':'Microsoft Teams','office teams':'Microsoft Teams',
     'google earth':'Google Earth','google maps':'Google Maps',
-    'google streetview':'Google Streetview','google street view':'Google Streetview','google syncview':'Google Streetview',
+    'google streetview':'Google Maps','google street view':'Google Maps','google syncview':'Google Maps',
     'google slides':'Google Slides','google docs':'Google Docs','google sheets':'Google Sheets',
     'flip':'Flip','microsoft flip':'Flip',
     'book creator':'Book Creator','garageband':'GarageBand',
@@ -2757,7 +2585,7 @@ function normaliseToolName(t){
   if(key.startsWith('delightex') || key.startsWith('cospaces')) return 'Delightex';
   if(key.startsWith('google earth')) return 'Google Earth';
   if(key.startsWith('google maps')) return 'Google Maps';
-  if(key.startsWith('google streetview') || key.startsWith('google street view') || key.startsWith('google syncview')) return 'Google Streetview';
+  if(key.startsWith('google streetview') || key.startsWith('google street view') || key.startsWith('google syncview')) return 'Google Maps';
   if(key.startsWith('google slides')) return 'Google Slides';
   if(key.startsWith('google docs')) return 'Google Docs';
   if(key.startsWith('google sheets')) return 'Google Sheets';

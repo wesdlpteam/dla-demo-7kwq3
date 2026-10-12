@@ -3,7 +3,7 @@ let DATA = [];
 // stamp on the <script src="js/..."> tags in DLA_Studio.html. Bumping the
 // number changes every code file's web address, which forces browsers to
 // download the new code instead of reusing a stale cached copy.
-const APP_VERSION = '5.67';
+const APP_VERSION = '5.71';
 
 // Reliable "get the latest version" action used by the ↻ latest button.
 // Reloads the whole app from the network with a one-off unique address so the
@@ -44,6 +44,65 @@ let AUDIT_YEAR_CAMPUS = '';
 const CHANGE_HISTORY = [];
 const LOCKS = {}; 
 const MAX_HISTORY = 20;
+
+// Bulk-work flag. While a long bulk job is running (it holds unit numbers across
+// waits), the live Drive sync must not reshuffle DATA underneath it. Jobs call
+// dlaBulkBusyBegin_/End_ (one entry per running job, so nested jobs do not switch
+// it off early). Each job has its own start time and time limit (20 minutes unless
+// the job asks for longer): a hung job is ignored once ITS limit passes, and never
+// keeps live sync paused forever or lets a newer job's pause lapse early.
+// The poller asks dlaBulkBusyNow_(), not the raw flag.
+window.DLA_BULK_BUSY = false;
+window.DLA_BULK_FLOWS_ = [];
+function bulkBusyActive_(flows, nowMs, defaultMaxMs){
+  const dflt = defaultMaxMs || 20 * 60 * 1000;
+  return (Array.isArray(flows) ? flows : []).some(function(f){
+    if(!f) return false;
+    if(!f.since) return true;
+    return (nowMs - f.since) <= (f.maxMs || dflt);
+  });
+}
+function dlaBulkBusyBegin_(maxMs){
+  const id = (window.DLA_BULK_FLOW_SEQ_ || 0) + 1;
+  window.DLA_BULK_FLOW_SEQ_ = id;
+  const flows = window.DLA_BULK_FLOWS_ || (window.DLA_BULK_FLOWS_ = []);
+  flows.push({ id: id, since: Date.now(), maxMs: maxMs || 0 });
+  window.DLA_BULK_BUSY = true;
+  return id;
+}
+function dlaBulkBusyEnd_(id){
+  const flows = window.DLA_BULK_FLOWS_ || (window.DLA_BULK_FLOWS_ = []);
+  let at = -1;
+  if(id === undefined) at = flows.length - 1;
+  else for(let i = 0; i < flows.length; i++){ if(flows[i].id === id){ at = i; break; } }
+  if(at >= 0) flows.splice(at, 1);
+  window.DLA_BULK_BUSY = flows.length > 0;
+}
+function dlaBulkBusyNow_(){
+  const flows = window.DLA_BULK_FLOWS_ || [];
+  if(!flows.length) return false;
+  const now = Date.now();
+  const live = flows.filter(function(f){ return bulkBusyActive_([f], now); });
+  if(live.length !== flows.length){
+    try{ console.warn('DLA: a bulk job has been marked busy past its time limit. It is being ignored for live sync.'); }catch(e){}
+    window.DLA_BULK_FLOWS_ = live;
+  }
+  window.DLA_BULK_BUSY = live.length > 0;
+  return live.length > 0;
+}
+function dlaWithBulkBusy_(fn, maxMs){
+  return async function(){
+    const id = dlaBulkBusyBegin_(maxMs);
+    try{ return await fn.apply(this, arguments); }
+    finally{ dlaBulkBusyEnd_(id); }
+  };
+}
+
+// Time limits for Google Drive requests (see driveFetch_ in js/08). Whole data.json
+// (about 11 MB) downloads and uploads get longer, because on slow school wifi they
+// can take over a minute; small calls (modified-time checks etc.) stay short.
+const DRIVE_FULL_FILE_TIMEOUT_MS_ = 180000;
+const DRIVE_SMALL_CALL_TIMEOUT_MS_ = 60000;
 
 const CLIENT_ID = 'sandbox-blocked'; /* sandbox: OAuth client removed */
 const ANALYTICS_SHEET_ID = 'sandbox-blocked'; /* sandbox: sheet id removed */
@@ -330,7 +389,10 @@ async function undoLastChange(){
   CHANGE_HISTORY.splice(pos, 1);
   DATA[h.idx].s = JSON.parse(JSON.stringify(h.oldSugs));
   if(typeof CURRENT_ENTRY_IDX !== 'undefined' && CURRENT_ENTRY_IDX === h.idx && typeof renderEntry === 'function') renderEntry(h.idx);
-  if(typeof saveToDrive === 'function') await saveToDrive();
+  if(typeof saveToDrive === 'function'){
+    try{ await saveToDrive(); }
+    catch(saveErr){ showSaveError_(saveErr); return; }
+  }
   if(typeof setStatus === 'function') setStatus('↶ Undid last suggestion change to "' + (DATA[h.idx].th || 'unit') + '"');
 }
 
@@ -426,7 +488,7 @@ function restoreSnapshot(id){
     return;
   }
 
-  saveToDrive();
+  saveToDrive().catch(showSaveError_);
   if(typeof renderBrowse === 'function') renderBrowse();
   if(typeof renderAuditChart === 'function') renderAuditChart();
   if(typeof renderBulkWelcome === 'function') renderBulkWelcome();

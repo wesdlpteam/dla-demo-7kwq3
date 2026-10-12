@@ -111,6 +111,15 @@ function setStatus(msg,type,html){
   el.style.color=type==='error'?'#f87171':type==='loading'?'#fbbf24':'#34d399';
 }
 
+// Put a failed save in the status bar in plain English. Used as .catch(showSaveError_)
+// on every un-awaited saveToDrive() call so a failed save is never silent.
+function showSaveError_(err){
+  const raw = err && err.message ? err.message : String(err || 'Unknown error');
+  const msg = /^(Not connected|Save failed)/.test(raw) ? raw : 'Save failed: ' + raw;
+  try{ setStatus(msg, 'error'); }catch(e){}
+  try{ console.error('DLA save error:', err); }catch(e){}
+}
+
 async function reconnectDrive(){
   const el=document.getElementById('status-bar');
   if(el){ el.textContent='Reconnecting to Drive…'; el.style.color='#fbbf24'; }
@@ -198,9 +207,41 @@ function showBackendSettingsSheet_(){
   setTimeout(() => input.focus(), 0);
 }
 
-async function getDriveToken(){
+// Asks the backend whether this Google account may use the Studio.
+// Returns {status:'ok', email} | {status:'denied', email} | {status:'unreachable'}.
+// Only an explicit ok:true counts as ok. A network failure, timeout, unreadable
+// reply or any other backend error is 'unreachable' (never treated as allowed).
+async function checkStudioAccess_(token){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(), 30000);
+  try{
+    const r=await fetch(SCRIPT_URL,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify({ action:'checkAccess', googleAccessToken:token }),
+      signal:controller.signal
+    });
+    const result=JSON.parse(await r.text());
+    if(result && result.ok===true){
+      return { status:'ok', email:String(result.email||'').toLowerCase().trim() };
+    }
+    const msg=String((result && result.error) || '');
+    if(/^Access denied for /.test(msg)){
+      return { status:'denied', email:msg.replace(/^Access denied for /,'').trim() };
+    }
+    return { status:'unreachable' };
+  }catch(e){
+    return { status:'unreachable' };
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+// opts.fresh = ask Google for a new token even though one is stored. The stored token
+// is left untouched until the new one arrives (other requests keep using it).
+async function getDriveToken(opts){
   
-  if(DRIVE_TOKEN) return DRIVE_TOKEN;
+  if(DRIVE_TOKEN && !(opts && opts.fresh)) return DRIVE_TOKEN;
   return new Promise((resolve,reject)=>{
     const client=google.accounts.oauth2.initTokenClient({
       client_id:CLIENT_ID,
@@ -208,48 +249,31 @@ async function getDriveToken(){
       callback:async (resp)=>{
         if(resp.error){ reject(new Error(resp.error)); return; }
         
-        // EMAIL ALLOWLIST — gate on the Studio screen so non-DLP staff get a clear
-        // "access denied" instead of an opaque Drive failure. Note: this is UX
-        // only — anyone can read this file and bypass it in DevTools. The real
-        // gate is gas_backend Code.js DLA_ALLOWED_EMAILS, which verifies the
-        // Google access token server-side. Keep this list in sync with that one.
-        const ALLOWED_EMAILS = [
-          'dlpteam@wesleycollege.edu.au',
-          'nathan.benn@wesleycollege.edu.au',
-          'david.howard@wesleycollege.edu.au',
-          'andrew.delmastro@wesleycollege.edu.au',
-          'delmastroa@wesleycollege.edu.au',
-          'kathryn.white@wesleycollege.edu.au',
-          'laura.sicklemore@wesleycollege.edu.au'
-        ];
-        
-        let email = '';
-        try{
-          const info=await fetch('sandbox://blocked/oauth2/v2/userinfo',{
-            headers:{'Authorization':'Bearer '+resp.access_token}
-          });
-          if(!info.ok) throw new Error('userinfo fetch failed');
-          const user=await info.json();
-          email=(user.email||'').toLowerCase().trim();
-        }catch(e){
-          // Silent fallback REMOVED — deny access if we can't verify the email
-          showAccessDenied('(could not verify identity)');
-          reject(new Error('Identity verification failed'));
-          return;
-        }
-        
-        if(!email || !ALLOWED_EMAILS.includes(email)){
+        // ACCESS CHECK: the backend decides who may use the Studio (it verifies
+        // the Google token against its own staff list). Nothing is granted unless
+        // the backend says ok; a failed check never lets anyone in.
+        const access=await checkStudioAccess_(resp.access_token);
+        if(access.status==='denied'){
           // Clear any stored hint so retrying shows the full account picker
           localStorage.removeItem('dla_user_email');
-          showAccessDenied(email || '(no email)');
+          showAccessDenied(access.email || '(no email)');
           reject(new Error('Access restricted to approved Wesley College DLP staff'));
           return;
         }
+        if(access.status!=='ok'){
+          reject(new Error('Could not check your access just now. Please try again.'));
+          return;
+        }
+        const email=access.email;
         
         DRIVE_TOKEN=resp.access_token;
         CURRENT_USER_EMAIL=email;
         localStorage.setItem('dla_user_email', email);
         resolve(resp.access_token);
+      },
+      // Popup blocked or closed: fail straight away instead of waiting for a timeout.
+      error_callback:(err)=>{
+        reject(new Error('Google sign-in could not open'+(err&&err.type?' ('+err.type+')':'')+'. Allow pop-ups for this site, then try again.'));
       }
     });
     
@@ -292,7 +316,10 @@ async function loadFromDrive(){
     // Google's CDN happily serves a stale media response for several minutes
     // after the underlying file changes — manifested as "fixes didn't stick"
     // when in fact Drive was already clean.
-    const r2=await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&supportsAllDrives=true&_=${Date.now()}`,{headers:{'Authorization':'Bearer '+tok,'Cache-Control':'no-cache'}});
+    // Time-limited (driveFetch_): this runs inside the save queue, so a stalled download
+    // must end with a clear message instead of holding up every save behind it.
+    DRIVE_TOKEN = tok;
+    const r2=await driveFetch_(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&supportsAllDrives=true&_=${Date.now()}`,{headers:{'Cache-Control':'no-cache'}},{timeoutMs:DRIVE_FULL_FILE_TIMEOUT_MS_});
     if(!r2.ok) throw new Error(`Failed to load canonical data.json (HTTP ${r2.status})`);
     // 2026-05-27: Fetch mtime BEFORE ingest so the cache stamp written
     // by ingest is fresh. Same reason as reloadFromDrive — otherwise
@@ -301,7 +328,10 @@ async function loadFromDrive(){
     DRIVE_TOKEN = tok;
     const initMeta = await getDriveFileModified();
     if(initMeta) LAST_KNOWN_MODIFIED = initMeta.modifiedTime;
-    ingest(await r2.json());
+    let loaded;
+    try{ loaded = await r2.json(); }
+    catch(je){ throw (je && je.name === 'AbortError') ? new Error('Google Drive did not finish sending data.json in time. Check your connection and try again.') : je; }
+    ingest(loaded);
     LIBRARIES_READY = false;
     ensureLibrariesLoaded().catch(e => console.warn('Libraries preload failed:', e)); // Load lesson libraries after Drive auth
   }catch(e){
@@ -357,7 +387,7 @@ function ingest(arr, skipCache){
   const toolEl=document.getElementById('f-tool');
   if(toolEl){ while(toolEl.options.length>1) toolEl.remove(1); allTools.forEach(t=>toolEl.add(new Option(t,t))); }
   
-  getDriveFileModified().then(meta=>{ if(meta) LAST_KNOWN_MODIFIED=meta.modifiedTime; });
+  getDriveFileModified({interactive:false}).then(meta=>{ if(meta) LAST_KNOWN_MODIFIED=meta.modifiedTime; });
   startConflictPolling();
   
   const campuses2=[...new Set(DATA.map(e=>e.ca))].sort();
@@ -382,19 +412,23 @@ function ingest(arr, skipCache){
 let LAST_KNOWN_MODIFIED = null;
 let SAVE_USER_TAG = null; 
 
-async function getDriveFileModified(){
+// cfg.interactive=false: background callers (pollers) never trigger a sign-in refresh.
+async function getDriveFileModified(cfg){
   if(!DRIVE_FILE_ID||!DRIVE_TOKEN) return null;
   try{
-    const r=await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?fields=modifiedTime,lastModifyingUser`,{
-      headers:{'Authorization':'Bearer '+DRIVE_TOKEN}
-    });
+    const r=await driveFetch_(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?fields=modifiedTime,lastModifyingUser`, undefined, cfg);
+    if(!r.ok) return null;
     const d=await r.json();
     return d;
   }catch{ return null; }
 }
 
 async function saveToDrive(){
-  if(!DRIVE_FILE_ID||!DRIVE_TOKEN) return;
+  if(!DRIVE_FILE_ID||!DRIVE_TOKEN){
+    const notConnected = new Error('Not connected to Google Drive. Sign in again, then save.');
+    showSaveError_(notConnected);
+    throw notConnected;
+  }
 
   
   const meta=await getDriveFileModified();
@@ -437,7 +471,7 @@ function startConflictPolling(){
   if(CONFLICT_POLL_INTERVAL) return;
   CONFLICT_POLL_INTERVAL=setInterval(async()=>{
     if(document.hidden||!DRIVE_FILE_ID||!DRIVE_TOKEN) return;
-    const meta=await getDriveFileModified();
+    const meta=await getDriveFileModified({interactive:false});
     if(meta&&LAST_KNOWN_MODIFIED&&meta.modifiedTime!==LAST_KNOWN_MODIFIED){
       const who=meta.lastModifyingUser?.displayName||'Someone';
       const when=new Date(meta.modifiedTime).toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit'});
@@ -471,9 +505,10 @@ async function reloadFromDrive(){
     // making reloadFromDrive return data that doesn't reflect the current
     // file. This was the root cause of the 2026-05-26 "fixes don't stick"
     // debug — Drive was clean, but the CDN kept replaying the pre-fix blob.
-    const r=await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&_=${Date.now()}`,{
-      headers:{'Authorization':'Bearer '+DRIVE_TOKEN,'Cache-Control':'no-cache'}
+    const r=await driveFetch_(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&_=${Date.now()}`,{
+      headers:{'Cache-Control':'no-cache'}
     });
+    if(!r.ok) throw new Error(r.status===401 ? 'Google sign-in expired. Sign in again, then reload.' : `Could not read data.json from Drive (HTTP ${r.status})`);
     const arr=await r.json();
     // 2026-05-27: Fetch fresh mtime BEFORE ingest so the cache stamp
     // written by ingest reflects Drive's truth-at-fetch-time, not the
@@ -594,6 +629,7 @@ function switchTab(tab,btn){
     renderBulkWelcome();
     renderSnapshotsList();
     renderPlaybooksList();
+    if(typeof renderMaintenanceBox === 'function') renderMaintenanceBox();
     if(typeof pollSuggestionAudit === 'function') pollSuggestionAudit();
     ensureLibrariesLoaded().then(() => {
       renderToolInventory();
@@ -611,32 +647,19 @@ async function deleteEntry(idx){
   if(!e) return;
   if(!confirm(`Delete "${e.th}" (${e.ca} ${e.yl})?\n\nThis cannot be undone.`)) return;
   DATA.splice(idx, 1);
-  await saveToDrive();
-  setStatus(`"${e.th}" deleted`);
+  let saveErr = null;
+  try{ await saveToDrive(); }catch(err){ saveErr = err; }
+  if(saveErr) showSaveError_(saveErr);
+  else setStatus(`"${e.th}" deleted`);
   closeEntry();
   renderBrowse();
   renderDashboard();
 }
 
 async function openEntry(idx){
-  // Check for existing lock (instant — local data only)
-  const existing = isLocked(idx) && !isLockedByMe(idx) ? isLocked(idx) : null;
-  if(existing){
-    if(!confirm(`⚠ ${existing.user} is currently editing "${DATA[idx]?.th}"\n\nOpen it anyway? Their unsaved changes may be overwritten.`)) return;
-  }
-
   // Render immediately — don't wait for Drive
   CURRENT_ENTRY_IDX=idx;
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-entry').classList.add('active');
   renderEntry(idx);
-
-  // Save lock in background (non-blocking)
-  if(!isLockedByMe(idx)){
-    if(!DATA._locks) DATA._locks = {};
-    DATA._locks[String(idx)] = { user: MY_USER, ts: Date.now() };
-    MY_LOCK_IDX = idx;
-    startLockHeartbeat(idx);
-    saveLocks(); // fire-and-forget — no await
-  }
 }

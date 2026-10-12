@@ -206,6 +206,23 @@ function invUpdateToolAge(tool, edge, value){
   setStatus(`Updated ${tool} age range to ${ageRangeLabel(next)}`);
 }
 
+// Whitelist display: sorted copy (the stored order is left alone), first
+// ceil(n/2) tools in the left column, the rest in the right column.
+function invSplitColumns_(list){
+  const sorted = (Array.isArray(list) ? list : []).slice().sort(function(a, b){
+    return String(a).localeCompare(String(b), undefined, { sensitivity: 'base' });
+  });
+  const half = Math.ceil(sorted.length * 0.5);
+  return { left: sorted.slice(0, half), right: sorted.slice(half) };
+}
+
+// Left column, 1px divider, right column. rowFn turns one tool into its row HTML.
+function invColumnsHtml_(cols, rowFn){
+  return '<div class="inv-col">' + cols.left.map(rowFn).join('') + '</div>'
+    + '<div class="inv-col-divider"></div>'
+    + '<div class="inv-col">' + cols.right.map(rowFn).join('') + '</div>';
+}
+
 function renderToolInventory(){
   const whitelistEl = document.getElementById('inv-whitelist-pills');
   const bannedEl = document.getElementById('inv-banned-pills');

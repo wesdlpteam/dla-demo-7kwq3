@@ -66,7 +66,7 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
 })();
 
 </script>
-<link rel="stylesheet" href="css/studio.css?v=5.67">
+<link rel="stylesheet" href="css/studio.css?v=5.71">
 </head>
 <body>
 <div id="sandbox-loading">Loading the DLA Studio demo…<span class="sl-sub">Sample data, nothing is connected</span></div>
@@ -376,7 +376,7 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
         <p style="font-size:12px;color:var(--dim);margin-bottom:14px">Control exactly which tools the AI can suggest. Changes sync with <code style="font-size:11px;color:var(--mint)">libraries.json</code>.</p>
 
         <div class="inventory-layout" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-          <div>
+          <div style="grid-column:1/-1;min-width:0">
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
               <span style="font-size:12px;font-weight:700;color:var(--lime)">✓ WHITELIST</span>
               <span id="inv-whitelist-count" style="font-size:10px;color:var(--dim);font-weight:600"></span>
@@ -393,7 +393,7 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
               <button id="inv-whitelist-add" data-inv-add="approved" type="button" class="btn-sm" onclick="invAddTool('approved')" style="color:var(--lime);border-color:var(--lime);padding:6px 12px">+ Add</button>
             </div>
             <div style="font-size:10px;color:var(--dim);margin-bottom:8px;line-height:1.5">Set the year-level range for each whitelisted tool. The AI will only suggest it inside that range.</div>
-            <div id="inv-whitelist-pills" style="display:flex;flex-direction:column;gap:6px;min-height:32px"></div>
+            <div id="inv-whitelist-pills" style="min-height:32px"></div>
           </div>
 
           <!-- Banned editing box hidden 2026-06-01: the whitelist is the single source of
@@ -459,16 +459,6 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
         </div>
       </div>
 
-      <!-- Clean up "The twist" wording -->
-      <div class="card" style="margin-bottom:14px">
-        <span class="label">Clean up "The twist" wording</span>
-        <p style="font-size:13px;color:var(--dim);margin-bottom:14px;line-height:1.6">One-pass cleanup that removes any leftover "The twist:" wording from already-saved suggestions across every unit. No AI and no cost — safe to run more than once.</p>
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-          <button class="btn-pri" id="btn-twist-sweep" onclick="runTwistSweep()">Clean up now →</button>
-          <span id="twist-sweep-status" style="font-size:13px;font-weight:600"></span>
-        </div>
-      </div>
-
       <!-- Refresh the public demo (sandbox repo rebuild) -->
       <div class="card" style="margin-bottom:14px">
         <span class="label">🌏 Refresh the public demo</span>
@@ -503,6 +493,13 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
         </div>
         <div id="comparison-grid"></div>
       </div>
+
+      <!-- Maintenance: the few bulk jobs worth running when new units are added -->
+      <details id="maintenance-box" class="card2" style="margin-top:14px;margin-bottom:14px;padding:14px 18px">
+        <summary style="cursor:pointer;font-weight:800;font-size:14px;color:var(--text)">Maintenance (bulk jobs)</summary>
+        <p style="font-size:13px;color:var(--dim);margin:10px 0 8px;line-height:1.6">Run these when new units are added. Each uses AI and costs a few cents per unit.</p>
+        <div id="maintenance-body"></div>
+      </details>
     </div>
 
     <!-- LIVE ANALYTICS -->
@@ -750,16 +747,16 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
 
 <!-- ?v=APP_VERSION cache-busts the code files. Bump this to match APP_VERSION
      in js/00-config-state-utils.js on every deploy so browsers fetch fresh code. -->
-<script src="js/00-config-state-utils.js?v=5.67"></script>
-<script src="js/01-inventory-helpers.js?v=5.67"></script>
-<script src="js/02-ui-load-navigation.js?v=5.67"></script>
-<script src="js/03-analytics-model.js?v=5.67"></script>
-<script src="js/04-audit-analytics-live.js?v=5.67"></script>
-<script src="js/05-bulk-setup-libraries.js?v=5.67"></script>
-<script src="js/06-bulk-router-chat.js?v=5.67"></script>
-<script src="js/07-bulk-actions.js?v=5.67"></script>
-<script src="js/09-legacy-restored.js?v=5.67"></script>
-<script src="js/08-export-sync-hotfixes.js?v=5.67"></script>
+<script src="js/00-config-state-utils.js?v=5.71"></script>
+<script src="js/01-inventory-helpers.js?v=5.71"></script>
+<script src="js/02-ui-load-navigation.js?v=5.71"></script>
+<script src="js/03-analytics-model.js?v=5.71"></script>
+<script src="js/04-audit-analytics-live.js?v=5.71"></script>
+<script src="js/05-bulk-setup-libraries.js?v=5.71"></script>
+<script src="js/06-bulk-router-chat.js?v=5.71"></script>
+<script src="js/07-bulk-actions.js?v=5.71"></script>
+<script src="js/09-legacy-restored.js?v=5.71"></script>
+<script src="js/08-export-sync-hotfixes.js?v=5.71"></script>
 </body>
 </html>
 
@@ -834,6 +831,10 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
   window.startConflictPolling = function () { /* sandbox: no Drive to poll */ };
   window.reloadFromDrive = function () { return Promise.resolve(); };
   window.loadUoiProposals = function () { return Promise.resolve([]); };
+  // Saving is pointless in the demo and would show a red "Save failed" (the guard
+  // blocks Drive). Resolve straight away without saving. The shim loads last, so
+  // this replaces the Studio's own save wrappers too.
+  try { saveToDrive = window.saveToDrive = function () { return Promise.resolve(); }; } catch (e) { window.saveToDrive = function () { return Promise.resolve(); }; }
 
   // ---- 3. Analytics: read from the local sample file, never Sheets --------
   window.getAnalyticsSheetTz = function () { return Promise.resolve('Australia/Melbourne'); };
@@ -858,15 +859,7 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
       'font:500 12px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;letter-spacing:.02em}' +
       '.sandbox-sample-note strong{font-weight:800}' +
       '.sandbox-off{opacity:.45;cursor:not-allowed!important;position:relative}' +
-      '.sandbox-off-note{font-size:11px;color:#888;margin-left:8px;font-weight:600}' +
-      // Tool Inventory whitelist fills the content width. It lives in
-      // #panel-tools as #inv-whitelist-pills, inside a two-column grid that
-      // pins it to a ~531px column. Collapse that grid to one column so the
-      // pills run the full width and the neighbouring block stacks underneath.
-      '#panel-tools div:has(> div > #inv-whitelist-pills){grid-template-columns:1fr!important}' +
-      '#panel-tools div:has(> #inv-whitelist-pills){grid-column:1/-1!important;width:100%}' +
-      '#inv-whitelist-pills{display:flex;flex-wrap:wrap;gap:8px;width:100%;max-width:none!important}' +
-      '#inv-whitelist-pills > *{flex:0 0 auto}';
+      '.sandbox-off-note{font-size:11px;color:#888;margin-left:8px;font-weight:600}';
     document.head.appendChild(css);
   }
 
@@ -913,7 +906,9 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
   // btn-seed-kinder is the dashboard's "Kinder year groups" one-time setup card;
   // Kinder is gone from the demo corpus entirely, so the card has nothing to
   // refer to.
-  var REMOVE_CARD_BY_BTN_ID = ['btn-twist-sweep', 'btn-suggestion-audit', 'btn-seed-kinder'];
+  var REMOVE_CARD_BY_BTN_ID = ['btn-suggestion-audit', 'btn-seed-kinder'];
+  // Whole sections removed by their own id (the Bulk screen's Maintenance box).
+  var REMOVE_BY_ID = ['maintenance-box'];
   // Controls created at runtime, so matched by their visible label.
   var REMOVE_BY_TEXT = [/inspire all/i, /sweep app smash/i, /makerspace/i];
 
@@ -939,6 +934,11 @@ font:600 15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;
       if (!btn) return;
       var card = btn.closest ? btn.closest('.card') : null;
       (card || btn).remove();
+    });
+
+    REMOVE_BY_ID.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.remove();
     });
 
     // b. remove runtime-created controls by label, plus their card when it is

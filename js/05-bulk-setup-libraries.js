@@ -690,9 +690,9 @@ const DEFAULT_APPROVED_TOOLS = [
   // Video / audio / animation
   'GarageBand', 'ScratchJR', 'Stop Motion Studio', 'ChatterPix Kids', 'iMovie',
   'Puppet Pals', 'Adobe Express', 'Podcasting using Canva', 'Animating a Character with Adobe Express',
-  // Subject specific (Google Earth + Google Maps are BANNED — students do not have
-  // Google accounts so cannot edit maps; the approved tool is Google Street View only)
-  'Google Street View', 'National Geographic MapMaker', 'Field Guide to Victoria', 'Sky Map', 'Geoboard',
+  // Subject specific (Google Earth is BANNED. Google Maps is approved but VIEW-ONLY: students
+  // have no Google login, so it is used for Street View walkthroughs; never name Street View as its own tool)
+  'Google Maps', 'National Geographic MapMaker', 'Field Guide to Victoria', 'Sky Map', 'Geoboard',
   // Other
   'Clickview', 'Epic', 'PicCollage', 'Brushes Redux', 'Word Clouds ABCya',
   'Sketchbook', 'Explain Everything', 'Freeform', 'Delightex', 'Kahoot', 'Tinkercad',
@@ -709,7 +709,7 @@ const DEFAULT_BANNED_TOOLS = [
   // Hardware banned
   'ClassVR', 'Green Screen Kits', 'Digital Cameras', 'Lego Spike Essential',
   // Other banned
-  'WeVideo', 'Flipgrid', 'Google Earth', 'Google Maps', 'Banqer', 'Apple Keynote'
+  'WeVideo', 'Flipgrid', 'Google Earth', 'Banqer', 'Apple Keynote'
 ];
 
 const DEFAULT_TOOL_AGE_RANGES = {
@@ -717,7 +717,7 @@ const DEFAULT_TOOL_AGE_RANGES = {
   'Seesaw': {min:-2,max:6}, 'Epic': {min:-2,max:6}, 'PicCollage': {min:-2,max:6},
   'Freeform': {min:-2,max:6}, 'Brushes Redux': {min:-2,max:6}, 'Book Creator': {min:-2,max:6},
   // All other Prep–Year 6
-  'GarageBand': {min:0,max:6}, 'iMovie': {min:0,max:6}, 'Google Street View': {min:0,max:6},
+  'GarageBand': {min:0,max:6}, 'iMovie': {min:0,max:6}, 'Google Maps': {min:0,max:6},
   'Google Earth': {min:0,max:6}, 'Clickview': {min:0,max:6}, 'Green Screen': {min:0,max:6},
   'iPads': {min:0,max:6}, 'Laptops': {min:0,max:6}, 'Digital Cameras': {min:0,max:6},
   'Sketchbook': {min:0,max:6},
@@ -844,7 +844,7 @@ const TOOL_AGE_GUIDE = `TOOL AGE GUIDE (HARD RULE — match Australian year leve
 - Year 4+: Microsoft Teams, Lego Spike Prime, CoDrone EDU, Minecraft Education (with scaffolding for Year 4)
 - Year 5+: 3D Printers, Python-based coding
 - Kinder-Year 6: Seesaw, Epic, PicCollage, Freeform, Brushes Redux, Book Creator
-- Prep-Year 6: GarageBand, iMovie, Google Street View, Clickview, Green Screen, iPads, Laptops, Digital Cameras, Sketchbook
+- Prep-Year 6: GarageBand, iMovie, Google Maps (view-only, Street View), Clickview, Green Screen, iPads, Laptops, Digital Cameras, Sketchbook
 NEVER propose a tool for a year level below its minimum age.`;
 
 // Map year level string → numeric year for age filtering
@@ -869,7 +869,7 @@ function getAgeAppropriateTools(yearLevel){
   const ALL = [
     // All ages
     {n:'Seesaw',      min:0}, {n:'Epic',         min:0}, {n:'GarageBand',   min:0},
-    {n:'iMovie',      min:0}, {n:'PicCollage',   min:0}, {n:'Google Street View', min:0},
+    {n:'iMovie',      min:0}, {n:'PicCollage',   min:0}, {n:'Google Maps', min:0},
     {n:'Clickview',   min:0}, {n:'Green Screen', min:0},
     {n:'iPads',       min:0}, {n:'Freeform',     min:0}, {n:'Sketchbook',   min:0},
     {n:'Brushes Redux',min:0},{n:'Delightex',    min:0}, {n:'Merge Cubes',  min:0},
@@ -1374,7 +1374,12 @@ async function fixAllOfType(type){
     // than save every unit to keep the upload count (and conflict checks) sane.
     if(fixedSinceSave>=SAVE_BATCH){
       if(lbl) lbl.textContent=`Saving progress — ${fixed} fixed so far…`;
-      await saveToDrive();
+      try{ await saveToDrive(); }
+      catch(saveErr){
+        showSaveError_(saveErr);
+        if(lbl) lbl.textContent=`Stopped: Drive save failed after ${fixed} fix${fixed!==1?'es':''}. Fix the connection, then click Fix again.`;
+        return;
+      }
       fixedSinceSave=0;
     }
     if(done<entries.length) await sleep(2000);
@@ -1382,7 +1387,14 @@ async function fixAllOfType(type){
 
   if(lbl) lbl.textContent=`Saving ${fixed} fix${fixed!==1?'es':''}…`;
   // Save the final partial batch (anything fixed since the last batch save).
-  if(fixedSinceSave>0) await saveToDrive();
+  if(fixedSinceSave>0){
+    try{ await saveToDrive(); }
+    catch(saveErr){
+      showSaveError_(saveErr);
+      if(lbl) lbl.textContent=`Drive save failed, ${fixedSinceSave} fix${fixedSinceSave!==1?'es':''} not saved yet. Fix the connection, then click Fix again.`;
+      return;
+    }
+  }
   if(lbl) lbl.textContent=`Done — ${fixed} fixed, ${failed} failed`;
   renderDashboard();
   // Don't hide failures — "Fixed 5" with 10 silent failures looked like the

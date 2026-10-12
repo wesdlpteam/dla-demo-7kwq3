@@ -1,3 +1,162 @@
+// ===== Safe saving helpers (2026-10-11) =====
+// Runs the functions it is given one at a time, in the order they were requested.
+// A failure in one run is passed to its own caller only; the next run still goes.
+function createSerialQueue_(){
+  let tail = Promise.resolve();
+  function run(fn){
+    const result = tail.then(function(){ return fn(); });
+    tail = result.then(function(){}, function(){});
+    return result;
+  }
+  run.run = run;
+  return run;
+}
+
+// Wraps a save so saves never overlap, and so a save that is queued but has not
+// started yet is shared: every request in that window gets the same run, which
+// will upload the latest DATA anyway.
+function createCoalescedRunner_(fn, sharedQueue){
+  const run = sharedQueue || createSerialQueue_();
+  let queued = null;
+  return function(){
+    if(queued) return queued;
+    const self = this;
+    const args = arguments;
+    const p = run(function(){ queued = null; return fn.apply(self, args); });
+    queued = p;
+    return p;
+  };
+}
+
+// One queue for everything that writes DATA from Drive or writes DATA to Drive:
+// saves, and full reloads. A reload never lands in the middle of a save.
+const driveWriteQueue_ = createSerialQueue_();
+
+// key -> signature for each entry (what the tab considers "already on Drive").
+function makeBaselineMap_(arr, keyFn, sigFn){
+  const map = {};
+  (Array.isArray(arr) ? arr : []).forEach(function(entry){
+    const key = keyFn(entry);
+    if(key) map[key] = sigFn(entry);
+  });
+  return map;
+}
+
+// Entries that differ from the baseline: new or edited ones, plus ones deleted locally.
+function diffAgainstBaseline_(baseline, entries, keyFn, sigFn){
+  const base = baseline || {};
+  const changed = [];
+  const local = new Map();
+  (Array.isArray(entries) ? entries : []).forEach(function(entry, idx){
+    const key = keyFn(entry);
+    if(key) local.set(key, { entry: entry, idx: idx });
+  });
+  local.forEach(function(info, key){
+    if(!base[key] || base[key] !== sigFn(info.entry)){
+      changed.push({ key: key, type: 'upsert', idx: info.idx, entry: info.entry, baselineSig: base[key] || '' });
+    }
+  });
+  Object.keys(base).forEach(function(key){
+    if(!local.has(key)) changed.push({ key: key, type: 'delete', baselineSig: base[key] });
+  });
+  return changed;
+}
+
+// After a save uploads, the tab swaps its data for the merged copy. Edits made
+// while the save was in flight must survive that swap. Entries whose signature now
+// differs from startSigs (the snapshot of what the upload contained) were edited
+// meanwhile: keep the live local version. Entries only present locally are added
+// (or, if they were in the snapshot, deleted meanwhile and so removed from the
+// result). Everything else takes the merged (remote) version; order follows merged.
+function keepInFlightEdits_(merged, current, startSigs, keyFn, sigFn){
+  const out = Array.isArray(merged) ? merged.slice() : [];
+  const sigs = startSigs || {};
+  const has = function(k){ return Object.prototype.hasOwnProperty.call(sigs, k); };
+  const outIdx = new Map();
+  out.forEach(function(e, i){ const k = keyFn(e); if(k) outIdx.set(k, i); });
+  const curKeys = new Set();
+  const removeIdx = new Set();
+  let kept = 0;
+  (Array.isArray(current) ? current : []).forEach(function(entry){
+    const k = keyFn(entry);
+    if(!k) return;
+    curKeys.add(k);
+    if(has(k) && sigs[k] === sigFn(entry)) return;       // untouched: merged version wins
+    kept++;
+    if(outIdx.has(k)) out[outIdx.get(k)] = entry; else out.push(entry);
+  });
+  Object.keys(sigs).forEach(function(k){
+    if(curKeys.has(k)) return;
+    if(outIdx.has(k)){ removeIdx.add(outIdx.get(k)); kept++; }   // deleted locally meanwhile
+  });
+  return { data: out.filter(function(_, i){ return !removeIdx.has(i); }), kept: kept };
+}
+
+function driveNotConnectedError_(){
+  return new Error('Not connected to Google Drive. Sign in again, then save.');
+}
+
+// fetch() for Google Drive. Adds the sign-in token, and when Drive answers 401
+// (expired token) asks for a fresh token ONCE and retries ONCE.
+//   cfg.interactive === false: background callers (pollers, automatic follow-up
+//     saves) never start a sign-in refresh; they just get the 401 back.
+//   cfg.timeoutMs (default DRIVE_SMALL_CALL_TIMEOUT_MS_, 60 s; full data.json transfers
+//     pass DRIVE_FULL_FILE_TIMEOUT_MS_, 180 s): the request is cancelled if it has not finished
+//     by then, so a stalled connection can never hold a save (or the save queue) forever.
+// The shared token is never cleared: it is replaced only when a new one arrives, and
+// a newer token obtained meanwhile is never overwritten by an older one.
+async function driveFetch_(url, opts, cfg){
+  const base = opts || {};
+  const interactive = !(cfg && cfg.interactive === false);
+  const timeoutMs = (cfg && cfg.timeoutMs) || DRIVE_SMALL_CALL_TIMEOUT_MS_;
+  const send = async function(tok){
+    const o = Object.assign({}, base, { headers: Object.assign({}, base.headers || {}, { 'Authorization': 'Bearer ' + tok }) });
+    let ctl = null;
+    if(typeof AbortController === 'function'){
+      ctl = new AbortController();
+      o.signal = ctl.signal;
+      // Deliberately not cleared on success: the limit also covers reading the body.
+      // Aborting a request that already finished does nothing.
+      const timer = setTimeout(function(){ ctl.abort(); }, timeoutMs);
+      if(timer && typeof timer.unref === 'function') timer.unref();
+    }
+    try{ return await fetch(url, o); }
+    catch(e){
+      if(ctl && ctl.signal.aborted) throw new Error('Google Drive did not answer within ' + Math.round(timeoutMs/1000) + ' seconds');
+      throw e;
+    }
+  };
+  const used = DRIVE_TOKEN;
+  const first = await send(used);
+  if(first.status !== 401) return first;
+  // Another request may already have refreshed the token while this one was in flight.
+  if(DRIVE_TOKEN && DRIVE_TOKEN !== used) return send(DRIVE_TOKEN);
+  if(!interactive) return first;
+  if(!driveFetch_.refresh_){
+    driveFetch_.refresh_ = (async function(){
+      let timer = null;
+      try{
+        const timeout = new Promise(function(_, reject){
+          timer = setTimeout(function(){ reject(new Error('Google sign-in refresh timed out')); }, 30000);
+        });
+        return await Promise.race([getDriveToken({ fresh: true }), timeout]);
+      }catch(e){
+        return null;
+      }finally{
+        if(timer) clearTimeout(timer);
+        driveFetch_.refresh_ = null;
+      }
+    })();
+  }
+  const fresh = await driveFetch_.refresh_;
+  if(!fresh){
+    if(DRIVE_TOKEN && DRIVE_TOKEN !== used) return send(DRIVE_TOKEN);
+    return first;
+  }
+  if(!DRIVE_TOKEN || DRIVE_TOKEN === used) DRIVE_TOKEN = fresh;   // replace only the token that failed
+  return send(DRIVE_TOKEN);
+}
+
 // 2026-05-28: Surgeon now reads a JSON response (was no-cors), shows the
 // count of requeued units, and prompts the user to immediately kick off
 // Inspire All to regenerate them through the full inspiring pipeline.
@@ -51,7 +210,7 @@ async function runSurgeon(){
     if(proceed && typeof inspireAllBatch === 'function'){
       await inspireAllBatch();
     } else if(proceed){
-      setStatus('Inspire All function not loaded — run it manually from the Inspire All card.', 'error');
+      setStatus('Inspire All function not loaded. Run it manually from the Maintenance box on the Bulk screen.', 'error');
     }
   }catch(e){
     stopProgress();
@@ -59,37 +218,6 @@ async function runSurgeon(){
     statusEl.textContent = '✗ ' + e.message;
   }
   btn.disabled = false;
-}
-
-// 2026-06-04: One-click cleanup that strips leftover "The twist:" wording from
-// already-saved suggestions (server-side sweepTwistLabels action). No AI, no cost,
-// idempotent. Mirrors runSurgeon's readable-fetch + status-span pattern.
-async function runTwistSweep(){
-  const btn = document.getElementById('btn-twist-sweep');
-  const statusEl = document.getElementById('twist-sweep-status');
-  if(btn) btn.disabled = true;
-  if(statusEl){ statusEl.style.color = '#fbbf24'; statusEl.textContent = 'Cleaning saved suggestions…'; }
-  startProgress();
-  try{
-    const r = await fetch(SCRIPT_URL, {
-      method:'POST',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify(withGASToken({ action:'sweepTwistLabels' }))
-    });
-    const result = await r.json();
-    stopProgress();
-    if(result.error){
-      if(statusEl){ statusEl.style.color = '#f87171'; statusEl.textContent = '✗ ' + (result.reason || result.message || result.error); }
-    } else if(result.sugsChanged > 0){
-      if(statusEl){ statusEl.style.color = 'var(--lime)'; statusEl.textContent = `✓ Cleaned ${result.sugsChanged} suggestion${result.sugsChanged===1?'':'s'} across ${result.unitsChanged} unit${result.unitsChanged===1?'':'s'}. Use ↻ to reload and see them.`; }
-    } else {
-      if(statusEl){ statusEl.style.color = 'var(--lime)'; statusEl.textContent = '✓ Nothing to clean — no "The twist" wording found.'; }
-    }
-  }catch(e){
-    stopProgress();
-    if(statusEl){ statusEl.style.color = '#f87171'; statusEl.textContent = '✗ ' + e.message; }
-  }
-  if(btn) btn.disabled = false;
 }
 
 // 2026-08-17: The demo copy of the site is no longer rebuilt automatically each
@@ -112,7 +240,7 @@ async function refreshPublicDemo(){
     const result = await r.json();
     stopProgress();
     if(result.started){
-      if(statusEl){ statusEl.style.color = 'var(--lime)'; statusEl.textContent = '✓ Rebuild started — the refreshed demo goes live in about five minutes.'; }
+      if(statusEl){ statusEl.style.color = 'var(--lime)'; statusEl.textContent = '✓ Demo rebuild requested. It takes a few minutes.'; }
     } else {
       const why = result.reason || result.message || result.error || 'no response from the backend';
       if(statusEl){ statusEl.style.color = '#f87171'; statusEl.textContent = '✗ Could not start the rebuild: ' + why; }
@@ -242,7 +370,7 @@ async function runBulkRegen(){
 
 // 2026-05-27: scanAndFixComponentDupes apparatus removed — under the
 // new single-tool rule, App Smash component duplicates cannot exist.
-// The Sweep App Smashes button on the Inspire All card handles any
+// The Sweep App Smashes button in the Maintenance box handles any
 // remaining "+" data from before the prompt rewrite.
 
 function updateCompareThemes(){
@@ -451,116 +579,6 @@ function clearSession(){
   document.getElementById('app-content').style.display='none';
   showScreen('load');
 }
-
-const LOCK_TTL = 5 * 60 * 1000; 
-let LOCK_HEARTBEAT = null;
-let MY_LOCK_IDX = null;
-const MY_USER = 'User-' + Math.random().toString(36).slice(2,6).toUpperCase();
-
-function getLocks(){
-  
-  return DATA._locks || {};
-}
-
-function isLocked(idx){
-  const locks = getLocks();
-  const lock = locks[String(idx)];
-  if(!lock) return null;
-  
-  if(Date.now() - lock.ts > LOCK_TTL) return null;
-  return lock;
-}
-
-function isLockedByMe(idx){
-  const lock = isLocked(idx);
-  return lock && lock.user === MY_USER;
-}
-
-async function acquireLock(idx){
-  if(isLockedByMe(idx)) return true; 
-  const existing = isLocked(idx);
-  if(existing){
-    return confirm(`⚠ ${existing.user} is currently editing "${DATA[idx]?.th}"\n\nOpen it anyway? Their unsaved changes may be overwritten.`);
-  }
-  
-  if(!DATA._locks) DATA._locks = {};
-  DATA._locks[String(idx)] = { user: MY_USER, ts: Date.now() };
-  MY_LOCK_IDX = idx;
-  await saveLocks();
-  startLockHeartbeat(idx);
-  return true;
-}
-
-async function releaseLock(idx){
-  if(!DATA._locks) return;
-  delete DATA._locks[String(idx)];
-  MY_LOCK_IDX = null;
-  stopLockHeartbeat();
-  await saveLocks();
-  renderLockIndicators();
-}
-
-async function saveLocks(){
-  if(!DRIVE_FILE_ID || !DRIVE_TOKEN) return;
-  try{
-    await fetch(`sandbox://blocked/upload/drive/v3/files/${DRIVE_FILE_ID}?uploadType=media`,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+DRIVE_TOKEN},
-      body: JSON.stringify(DATA, null, 2)
-    });
-  }catch{}
-}
-
-function startLockHeartbeat(idx){
-  stopLockHeartbeat();
-  
-  LOCK_HEARTBEAT = setInterval(async()=>{
-    if(!DATA._locks) DATA._locks = {};
-    DATA._locks[String(idx)] = { user: MY_USER, ts: Date.now() };
-    await saveLocks();
-  }, 2 * 60 * 1000);
-  
-  window.addEventListener('beforeunload', ()=>{ releaseLock(idx); });
-}
-
-function stopLockHeartbeat(){
-  if(LOCK_HEARTBEAT){ clearInterval(LOCK_HEARTBEAT); LOCK_HEARTBEAT = null; }
-}
-
-function renderLockIndicators(){
-  
-  document.querySelectorAll('[data-entry-idx]').forEach(el=>{
-    const idx = parseInt(el.dataset.entryIdx);
-    const lock = isLocked(idx);
-    const badge = el.querySelector('.lock-badge');
-    if(lock && !isLockedByMe(idx)){
-      if(badge) badge.textContent = '🔒 '+lock.user;
-      else {
-        const b = document.createElement('span');
-        b.className = 'lock-badge';
-        b.style.cssText = 'font-size:10px;color:#fbbf24;font-weight:700;margin-left:6px';
-        b.textContent = '🔒 '+lock.user;
-        el.appendChild(b);
-      }
-    } else if(badge){
-      badge.remove();
-    }
-  });
-}
-
-setInterval(async()=>{
-  if(!DRIVE_FILE_ID || !DRIVE_TOKEN || document.hidden) return;
-  try{
-    const r = await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media`,{
-      headers:{'Authorization':'Bearer '+DRIVE_TOKEN}
-    });
-    const fresh = await r.json();
-    if(fresh._locks){
-      DATA._locks = fresh._locks;
-      renderLockIndicators();
-    }
-  }catch{}
-}, 30000);
 
 (function init(){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -838,20 +856,23 @@ setInterval(async()=>{
     if(whCountEl) whCountEl.textContent = approved.length ? `(${approved.length})` : '';
     if(banCountEl) banCountEl.textContent = banned.length ? `(${banned.length})` : '';
     if(totalEl) totalEl.textContent = (approved.length || banned.length) ? `${approved.length + banned.length} entries` : '';
-    whitelistEl.innerHTML = approved.length ? approved.map(t => {
+    whitelistEl.classList.toggle('inv-two-col', approved.length > 0);
+    whitelistEl.innerHTML = approved.length ? invColumnsHtml_(invSplitColumns_(approved), t => {
       const range = (typeof getToolAgeRange === 'function') ? getToolAgeRange(t) : {min:0,max:6};
       const toolAttr = invAttr(t);
       const rwNote = (typeof getToolAffordance_ === 'function') ? getToolAffordance_(t) : null;
       const rwOn = !!(rwNote && rwNote.realWorld);
-      return `<div style="display:grid;grid-template-columns:minmax(150px,1fr) 105px 105px auto auto auto;gap:6px;align-items:center;padding:7px 8px;background:rgba(197,232,74,0.08);border:1px solid rgba(197,232,74,0.3);border-radius:12px;font-size:12px;color:var(--lime)">
+      return `<div class="inv-row" style="display:grid;grid-template-columns:minmax(0,1fr) 96px 96px auto;gap:6px;align-items:center;padding:7px 8px;background:rgba(197,232,74,0.08);border:1px solid rgba(197,232,74,0.3);border-radius:12px;font-size:12px;color:var(--lime)">
         <div style="min-width:0"><div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t)}</div><div style="font-size:10px;color:var(--dim);font-weight:600">${ageRangeLabel(range)}</div></div>
         <select class="inp" data-inv-age-tool="${toolAttr}" data-inv-age-edge="min" title="Minimum year level" style="margin-bottom:0;font-size:11px;padding:5px 7px;color:var(--lime);border-color:rgba(197,232,74,.3)">${yearSelectOptions(range.min)}</select>
         <select class="inp" data-inv-age-tool="${toolAttr}" data-inv-age-edge="max" title="Maximum year level" style="margin-bottom:0;font-size:11px;padding:5px 7px;color:var(--lime);border-color:rgba(197,232,74,.3)">${yearSelectOptions(range.max)}</select>
+        <div class="inv-actions" style="display:flex;align-items:center;gap:6px;min-width:0">
         <label title="Weave a real-world AI connection into this tool's suggestions" style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:600;color:var(--dim);cursor:pointer;white-space:nowrap;user-select:none"><input type="checkbox" data-inv-rw="${toolAttr}" ${rwOn ? 'checked' : ''} style="accent-color:var(--lime);cursor:pointer">AI real-world</label>
         <button type="button" data-inv-edit-note="${toolAttr}" style="background:transparent;border:none;color:var(--lime);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;opacity:.8" title="Edit how the AI should use this tool (what it's for, good uses, real-world examples)">✎</button>
         <button type="button" data-inv-remove="approved" data-inv-tool="${toolAttr}" style="background:transparent;border:none;color:var(--lime);cursor:pointer;padding:0 6px;font-size:18px;line-height:1;opacity:.8" title="Remove">×</button>
+        </div>
       </div>`;
-    }).join('') : '<span style="font-size:11px;color:var(--dim);font-style:italic">No whitelist — all approved tools allowed.</span>';
+    }) : '<span style="font-size:11px;color:var(--dim);font-style:italic">No whitelist — all approved tools allowed.</span>';
     bannedEl.innerHTML = banned.length ? banned.map(t => `<span style="display:inline-flex;align-items:center;gap:4px;padding:4px 4px 4px 10px;background:rgba(255,128,128,0.08);border:1px solid rgba(255,128,128,0.3);border-radius:99px;font-size:12px;font-weight:600;color:#FF8080">${esc(t)}<button type="button" data-inv-remove="banned" data-inv-tool="${invAttr(t)}" style="background:transparent;border:none;color:#FF8080;cursor:pointer;padding:0 6px;font-size:14px;line-height:1;opacity:.7" title="Remove">×</button></span>`).join('') : '<span style="font-size:11px;color:var(--dim);font-style:italic">No bans.</span>';
   };
   window.renderToolInventory = renderToolInventory;
@@ -1819,7 +1840,7 @@ setInterval(async()=>{
     setTimeout(function(){ hvApplyGoldDomState_(idx, next); }, 30);
     setTimeout(function(){ hvApplyGoldDomState_(idx, next); }, 250);
 
-    try { if(typeof saveToDrive === 'function') saveToDrive(); } catch(e){ console.warn('Human verify save failed:', e); }
+    try { if(typeof saveToDrive === 'function') saveToDrive().catch(showSaveError_); } catch(e){ console.warn('Human verify save failed:', e); }
   };
 
   // Apply the stronger CSS immediately for already-rendered verified rows.
@@ -1955,8 +1976,7 @@ setInterval(async()=>{
       window.startProgress = function(){};
       window.stopProgress = function(){};
       window.showProgress = function(){};
-      const maybe = saveToDrive();
-      if(maybe && typeof maybe.then === 'function') await maybe;
+      await saveToDrive();
     }catch(e){
       console.warn('Human verification background save failed:', e);
       try { if(typeof setStatus === 'function') setStatus('Human verification changed locally, but Drive save failed: ' + (e.message || e), 'error'); } catch(_){}
@@ -2115,10 +2135,7 @@ setInterval(async()=>{
   function bgSafeSave_(){
     try{
       if(typeof saveToDrive !== 'function') return;
-      const result = saveToDrive();
-      if(result && typeof result.catch === 'function'){
-        result.catch(function(err){ bgReport_(err, 'saveToDrive after Bulk AI changes'); });
-      }
+      saveToDrive().catch(function(err){ bgReport_(err, 'saveToDrive after Bulk AI changes'); });
     }catch(err){
       bgReport_(err, 'saveToDrive after Bulk AI changes');
     }
@@ -2260,13 +2277,13 @@ setInterval(async()=>{
       const note = bits.length ? ' (' + bits.join(', ') + ')' : '';
 
       if(appliedRealismFixes && typeof rescanRealismAfterApprovedFixes_ === 'function'){
-        try { if(typeof setStatus === 'function') setStatus(`${applied} suggestion${applied!==1?'s':''} updated and saved${note} — rescanning realism audit…`, 'loading'); } catch(e){}
+        try { if(typeof setStatus === 'function') setStatus(`${applied} suggestion${applied!==1?'s':''} updated${note} — saving, then rescanning realism audit…`, 'loading'); } catch(e){}
         setTimeout(function(){
           try { rescanRealismAfterApprovedFixes_(applied, skippedDupes); }
           catch(err){ bgReport_(err, 'rescanRealismAfterApprovedFixes'); }
         }, 250);
       } else {
-        try { if(typeof setStatus === 'function') setStatus(`${applied} suggestion${applied!==1?'s':''} updated and saved${note}`); } catch(e){}
+        try { if(typeof setStatus === 'function') setStatus(`${applied} suggestion${applied!==1?'s':''} updated${note} — saving to Drive…`, 'loading'); } catch(e){}
       }
 
       try { if(typeof renderAuditChart === 'function') renderAuditChart(); } catch(e){ console.warn('renderAuditChart after bulk apply failed:', e); }
@@ -2336,16 +2353,17 @@ setInterval(async()=>{
     return !!(String(c.t || '').trim() || String(c.d || '').trim());
   }
 
+  // Starts the save and remembers it in window.__dlaApplySave_ (a promise that resolves to
+  // true when the save worked, false when it failed), so later messages can wait for it.
   function perfSafeSave_(){
+    window.__dlaApplySave_ = Promise.resolve(false);
     try{
       if(typeof saveToDrive !== 'function') return;
-      const result = saveToDrive();
-      if(result && typeof result.catch === 'function'){
-        result.catch(function(err){
-          console.warn('Drive save failed after Bulk/Realism apply:', err);
-          perfSetStatus_('Changes applied locally, but Drive save failed: ' + (err && err.message ? err.message : err), 'error');
-        });
-      }
+      window.__dlaApplySave_ = saveToDrive().catch(function(err){
+        console.warn('Drive save failed after Bulk/Realism apply:', err);
+        perfSetStatus_('Changes applied locally, but Drive save failed: ' + (err && err.message ? err.message : err), 'error');
+        return false;
+      }).then(function(ok){ return ok !== false; });
     }catch(err){
       console.warn('Drive save failed after Bulk/Realism apply:', err);
       perfSetStatus_('Changes applied locally, but Drive save failed: ' + (err && err.message ? err.message : err), 'error');
@@ -2429,7 +2447,12 @@ setInterval(async()=>{
       }
     }catch(e){
       console.warn('Auto-rescan after approved fixes failed:', e);
-      perfSetStatus_('Fixes saved, but automatic rescan failed — run Scan all suggestions again.', 'error');
+      // Only say "saved" once the save has really finished and worked.
+      let saved = false;
+      try{ saved = await (window.__dlaApplySave_ || Promise.resolve(false)); }catch(e2){ saved = false; }
+      perfSetStatus_(saved
+        ? 'Fixes saved, but automatic rescan failed — run Scan all suggestions again.'
+        : 'Automatic rescan failed — run Scan all suggestions again. The fixes are applied here but are not saved to Drive yet.', 'error');
     }
   };
 
@@ -2546,7 +2569,7 @@ setInterval(async()=>{
   const BASELINE_FIELD = '__dlaMergeBaseline_v1';
   const SIG_FIELD = 'humanVerifiedSuggestionSignature';
   const VOLATILE_ENTRY_FIELDS = new Set([
-    '_locks', '_mergeLocalTouchedAt', '_mergeLocalTouchedBy'
+    '_mergeLocalTouchedAt', '_mergeLocalTouchedBy'
   ]);
 
   function mergeDeepClone_(value){
@@ -2629,12 +2652,7 @@ setInterval(async()=>{
   }
 
   function mergeMakeBaselineFromData_(arr){
-    const map = {};
-    (Array.isArray(arr) ? arr : []).forEach(function(entry){
-      const key = mergeEntryKey_(entry);
-      if(key) map[key] = mergeEntrySig_(entry);
-    });
-    return map;
+    return makeBaselineMap_(arr, mergeEntryKey_, mergeEntrySig_);
   }
 
   function mergeCaptureBaseline_(arr){
@@ -2663,39 +2681,29 @@ setInterval(async()=>{
   }
 
   function mergeChangedLocalEntries_(){
-    const baseline = window[BASELINE_FIELD] || {};
-    const changed = [];
-    const currentKeys = new Set();
-    const local = mergeLocalMap_();
-    local.forEach(function(info, key){
-      currentKeys.add(key);
-      if(!baseline[key] || baseline[key] !== mergeEntrySig_(info.entry)){
-        changed.push({ key, type:'upsert', idx: info.idx, entry: info.entry, baselineSig: baseline[key] || '' });
-      }
-    });
-    Object.keys(baseline).forEach(function(key){
-      if(!currentKeys.has(key)) changed.push({ key, type:'delete', baselineSig: baseline[key] });
-    });
-    return changed;
+    return diffAgainstBaseline_(window[BASELINE_FIELD] || {}, DATA, mergeEntryKey_, mergeEntrySig_);
   }
 
-  async function mergeFetchLatestData_(){
-    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) throw new Error('Drive is not connected');
-    const r = await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&cacheBust=${Date.now()}`, {
-      headers: { 'Authorization': 'Bearer ' + DRIVE_TOKEN, 'Cache-Control': 'no-cache' }
-    });
-    if(!r.ok) throw new Error('Could not read latest data.json from Drive before saving');
-    const d = await r.json();
+  // net = { interactive } passed on to driveFetch_ (false for the automatic follow-up save).
+  async function mergeFetchLatestData_(net){
+    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) throw driveNotConnectedError_();
+    const r = await driveFetch_(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&cacheBust=${Date.now()}`, {
+      headers: { 'Cache-Control': 'no-cache' }
+    }, { interactive: !(net && net.interactive === false), timeoutMs: DRIVE_FULL_FILE_TIMEOUT_MS_ });
+    if(!r.ok) throw new Error(r.status === 401 ? 'Google sign-in expired. Sign in again, then save.' : 'Could not read latest data.json from Drive before saving (HTTP ' + r.status + ')');
+    let d;
+    try{ d = await r.json(); }
+    catch(e){ throw (e && e.name === 'AbortError') ? new Error('Google Drive did not finish sending data.json in time. Try saving again.') : e; }
     return Array.isArray(d) ? d : Object.values(d || {});
   }
 
-  async function mergeUploadData_(arr){
-    const r = await fetch(`sandbox://blocked/upload/drive/v3/files/${DRIVE_FILE_ID}?uploadType=media`,{
+  async function mergeUploadData_(arr, net){
+    const r = await driveFetch_(`sandbox://blocked/upload/drive/v3/files/${DRIVE_FILE_ID}?uploadType=media`,{
       method:'PATCH',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+DRIVE_TOKEN},
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify(arr,null,2)
-    });
-    if(!r.ok) throw new Error('Drive save failed while uploading merged data.json');
+    }, { interactive: !(net && net.interactive === false), timeoutMs: DRIVE_FULL_FILE_TIMEOUT_MS_ });
+    if(!r.ok) throw new Error(r.status === 401 ? 'Google sign-in expired. Sign in again, then save.' : 'Drive save failed while uploading merged data.json (HTTP ' + r.status + ')');
   }
 
   function mergeConflictLabel_(entry, key){
@@ -2761,37 +2769,59 @@ setInterval(async()=>{
     return { latest, applied, skipped, deleted, conflicts: conflicts.length };
   }
 
-  async function saveToDriveConcurrentMerge_(){
-    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) return;
+  // The real uploader. Only ever run through saveToDriveQueued_ below, so the
+  // fetch-latest, merge, upload sequence of one save never mixes with another.
+  // true when a person asked for a save since the last run started. The automatic
+  // follow-up save (for edits made while saving) never sets it, so it cannot pop up
+  // a sign-in window the person did not ask for.
+  let interactiveWanted_ = false;
+
+  async function saveToDriveRun_(){
+    const net = { interactive: interactiveWanted_ };
+    interactiveWanted_ = false;
+    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) throw driveNotConnectedError_();
 
     if(!window[BASELINE_FIELD]) mergeCaptureBaseline_(DATA);
 
     try { if(typeof cleanAllDataSuggestionsHotfix_ === 'function') cleanAllDataSuggestionsHotfix_(); } catch(e){}
 
     const localChanges = mergeChangedLocalEntries_();
+    // What the local data looked like when this save started. Edits made after this
+    // (while the save is in flight) are kept when the merged copy replaces DATA.
+    let consumedSigs = mergeMakeBaselineFromData_(DATA);
     const oldStart = window.startProgress || function(){};
     const oldStop = window.stopProgress || function(){};
     const quietMode = oldStart && String(oldStart).indexOf('function(){}') !== -1;
 
     if(!quietMode) startProgress();
+    window.DLA_SAVE_IN_FLIGHT = true;   // live sync stands down until this save is done
     try{
-      const latest = await mergeFetchLatestData_();
+      const latest = await mergeFetchLatestData_(net);
       let merged = latest;
       let summary = { applied:0, skipped:0, deleted:0, conflicts:0 };
 
       if(localChanges.length){
         summary = mergeApplyLocalChangesToLatest_(latest, localChanges);
         merged = summary.latest;
-        await mergeUploadData_(merged);
+        // The upload holds the local data as it is right now (after the merge step), so
+        // only edits made from this point on count as "in flight".
+        consumedSigs = mergeMakeBaselineFromData_(DATA);
+        await mergeUploadData_(merged, net);
       } else {
         // No local content changes: refresh this tab to the latest Drive copy without writing over anyone.
       }
 
-      DATA = Array.isArray(merged) ? merged : Object.values(merged || {});
-      mergeCaptureBaseline_(DATA);
+      const uploaded = Array.isArray(merged) ? merged : Object.values(merged || {});
+      const inFlight = keepInFlightEdits_(uploaded, DATA, consumedSigs, mergeEntryKey_, mergeEntrySig_);
+      DATA = inFlight.data;
+      // Baseline = what is really on Drive now, so in-flight edits still count as unsaved changes.
+      mergeCaptureBaseline_(uploaded);
+      // Remembered for the live-sync side: after a save its baseline must be this uploaded
+      // copy too, never DATA (which may already hold edits made while the save was running).
+      window.__dlaLastUploadedBaseline = mergeDeepClone_(window[BASELINE_FIELD]);
       try{ localStorage.setItem('dla_data', JSON.stringify(DATA)); }catch(e){}
 
-      const updated = await getDriveFileModified();
+      const updated = await getDriveFileModified(net);
       if(updated) LAST_KNOWN_MODIFIED = updated.modifiedTime;
 
       const now = new Date().toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit'});
@@ -2799,27 +2829,42 @@ setInterval(async()=>{
         ? `Merged save at ${now}: ${summary.applied} unit${summary.applied!==1?'s':''} updated${summary.deleted?`, ${summary.deleted} deleted`:''}`
         : `Already up to date at ${now}`;
       if(summary.skipped) msg += ` · ${summary.skipped} same-unit conflict${summary.skipped!==1?'s':''} kept from Drive`;
+      if(inFlight.kept) msg += ` · ${inFlight.kept} edit${inFlight.kept!==1?'s':''} made while saving will be saved next`;
       if(typeof setStatus === 'function') setStatus(msg, summary.skipped ? 'loading' : undefined);
+
+      // Edits made during the save are still unsaved: queue one more save. Do NOT await
+      // it (it runs after this one finishes); it joins any save that is already waiting.
+      if(inFlight.kept) saveToDriveQueued_().catch(showSaveError_);
 
       try{
         if(typeof CURRENT_ENTRY_IDX !== 'undefined' && CURRENT_ENTRY_IDX !== null && typeof renderEntry === 'function') renderEntry(CURRENT_ENTRY_IDX);
       }catch(e){}
       return summary;
     }catch(e){
-      if(typeof setStatus === 'function') setStatus('Merged Drive save failed: ' + (e.message || e), 'error');
+      showSaveError_(e);
       console.error('DLA concurrent merge save failed:', e);
       throw e;
     }finally{
+      window.DLA_SAVE_IN_FLIGHT = false;
       if(!quietMode) stopProgress();
     }
   }
 
+  const saveToDriveQueued_ = createCoalescedRunner_(saveToDriveRun_, driveWriteQueue_);
+
+  async function saveToDriveConcurrentMerge_(){
+    // Never a silent no-op: tell the person straight away.
+    if(!DRIVE_FILE_ID || !DRIVE_TOKEN){
+      const notConnected = driveNotConnectedError_();
+      showSaveError_(notConnected);
+      throw notConnected;
+    }
+    interactiveWanted_ = true;
+    return saveToDriveQueued_();
+  }
+
   // Replace full-file saves with merge saves.
   saveToDrive = window.saveToDrive = saveToDriveConcurrentMerge_;
-
-  // Important: the old lock heartbeat wrote the whole stale DATA array to Drive.
-  // Disable Drive lock saves so opening/releasing an entry cannot overwrite Andrew's work.
-  saveLocks = window.saveLocks = async function(){ return; };
 
   // Baseline the exact Drive version whenever data is loaded or reloaded.
   if(typeof ingest === 'function'){
@@ -2884,7 +2929,7 @@ setInterval(async()=>{
   const RT_INTERVAL_MS = 5000;
   const RT_SYNC_BUTTON_ID = 'dla-manual-sync-btn';
   const RT_SYNC_LABEL_ID = 'dla-sync-status-chip';
-  const VOLATILE_FIELDS = new Set(['_locks','_mergeLocalTouchedAt','_mergeLocalTouchedBy']);
+  const VOLATILE_FIELDS = new Set(['_mergeLocalTouchedAt','_mergeLocalTouchedBy']);
   let rtTimer = null;
   let rtBusy = false;
   let rtLastSeenModified = null;
@@ -2936,6 +2981,9 @@ setInterval(async()=>{
     return fresh;
   }
 
+  // Only for moments when DATA really matches Drive (a load, a reload, a sync that pulled
+  // the remote copy). After a SAVE use window.__dlaLastUploadedBaseline instead: DATA may
+  // already hold edits made while the save was running, and those must stay "unsaved".
   function rtSetBaseline_(arrOrMap){
     const map = Array.isArray(arrOrMap) ? rtMakeBaseline_(arrOrMap) : (arrOrMap || {});
     window[RT_BASELINE_FIELD] = map;
@@ -2967,11 +3015,11 @@ setInterval(async()=>{
   }
 
   async function rtFetchLatestData_(){
-    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) throw new Error('Drive is not connected');
-    const r = await fetch(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&cacheBust=${Date.now()}`, {
-      headers: { 'Authorization':'Bearer ' + DRIVE_TOKEN, 'Cache-Control':'no-cache' }
-    });
-    if(!r.ok) throw new Error('Could not fetch latest data.json from Drive');
+    if(!DRIVE_FILE_ID || !DRIVE_TOKEN) throw driveNotConnectedError_();
+    const r = await driveFetch_(`sandbox://blocked/drive/v3/files/${DRIVE_FILE_ID}?alt=media&cacheBust=${Date.now()}`, {
+      headers: { 'Cache-Control':'no-cache' }
+    }, { interactive: false, timeoutMs: DRIVE_FULL_FILE_TIMEOUT_MS_ });   // background poll: never starts a sign-in refresh
+    if(!r.ok) throw new Error('Could not fetch latest data.json from Drive (HTTP ' + r.status + ')');
     const d = await r.json();
     return Array.isArray(d) ? d : Object.values(d || {});
   }
@@ -3072,6 +3120,8 @@ setInterval(async()=>{
   }
 
   function rtReplaceAll_(latest, currentKey){
+    // A bulk job holds unit numbers; swapping DATA now would point them at the wrong units.
+    if(dlaBulkBusyNow_() || window.DLA_SAVE_IN_FLIGHT) return;
     DATA = Array.isArray(latest) ? latest : Object.values(latest || {});
     rtSetBaseline_(DATA);
     try { localStorage.removeItem('dla_data'); } catch(e){}
@@ -3079,6 +3129,7 @@ setInterval(async()=>{
   }
 
   function rtMergeUntouched_(latest, localChangedKeys, currentKey){
+    if(dlaBulkBusyNow_() || window.DLA_SAVE_IN_FLIGHT) return 0;   // see rtReplaceAll_
     const latestMap = rtMap_(latest);
     const localMap = rtMap_(DATA);
     const baseline = rtClone_(rtGetBaseline_());
@@ -3115,11 +3166,15 @@ setInterval(async()=>{
   }
 
   async function syncFromDriveNow_(reason){
+    if(dlaBulkBusyNow_() || window.DLA_SAVE_IN_FLIGHT){
+      if(reason === 'manual') rtStatus_('Sync is paused while a bulk job or save is running. Try again when it finishes.', 'loading');
+      return {synced:false, reason:'bulk-busy'};
+    }
     if(rtBusy || !DRIVE_FILE_ID || !DRIVE_TOKEN) return {synced:false, reason:'busy-or-disconnected'};
     if(document.hidden && reason !== 'manual' && reason !== 'visible') return {synced:false, reason:'hidden'};
     rtBusy = true;
     try{
-      const meta = await getDriveFileModified();
+      const meta = await getDriveFileModified({ interactive: false });
       if(!meta || !meta.modifiedTime) return {synced:false, reason:'no-meta'};
       const remoteModified = meta.modifiedTime;
       const known = rtLastSeenModified || LAST_KNOWN_MODIFIED;
@@ -3131,6 +3186,8 @@ setInterval(async()=>{
       // force/after-save/human-verify deliberately bypass the modified-time shortcut so
       // the tab can pull any merge-preserved edits immediately after a local save.
 
+      const prevSeenModified = rtLastSeenModified;
+      const prevKnownModified = LAST_KNOWN_MODIFIED;
       rtLastSeenModified = remoteModified;
       LAST_KNOWN_MODIFIED = remoteModified;
 
@@ -3139,6 +3196,12 @@ setInterval(async()=>{
 
       const currentKey = rtRememberCurrentEntryKey_();
       const latest = await rtFetchLatestData_();
+      if(dlaBulkBusyNow_() || window.DLA_SAVE_IN_FLIGHT){
+        // A bulk job or save started while we were downloading. Forget this poll so the next one pulls the change.
+        rtLastSeenModified = prevSeenModified;
+        LAST_KNOWN_MODIFIED = prevKnownModified;
+        return {synced:false, reason:'bulk-busy'};
+      }
       const localChanged = rtLocalChangedKeys_();
 
       if(!localChanged.size){
@@ -3207,7 +3270,9 @@ setInterval(async()=>{
     const oldSaveToDrive = saveToDrive;
     saveToDrive = window.saveToDrive = async function(){
       const out = await oldSaveToDrive.apply(this, arguments);
-      rtSetBaseline_(DATA || []);
+      // The uploaded copy, not DATA (see rtSetBaseline_). The merge baseline was already set by the uploader.
+      const uploadedBase = window.__dlaLastUploadedBaseline;
+      if(uploadedBase && typeof uploadedBase === 'object') window[RT_BASELINE_FIELD] = rtClone_(uploadedBase);
       rtLastSeenModified = LAST_KNOWN_MODIFIED || rtLastSeenModified;
       return out;
     };
@@ -3645,7 +3710,14 @@ setInterval(async()=>{
         else { e.humanVerified = false; e.verified = false; }
         changed.push(p.entryIdx);
       });
-      await saveToDrive();
+      try{ await saveToDrive(); }
+      catch(saveErr){
+        showSaveError_(saveErr);
+        this.disabled = false;
+        this.textContent = 'Apply ' + patches.length + ' change' + (patches.length!==1?'s':'') + ' (retry save)';
+        try{ renderBrowse?.(); renderDashboard?.(); }catch(e){}
+        return;
+      }
       overlay.remove();
       try{ if(CURRENT_ENTRY_IDX != null) renderEntry(CURRENT_ENTRY_IDX); }catch(e){}
       try{ renderBrowse?.(); renderDashboard?.(); }catch(e){}
@@ -4065,5 +4137,45 @@ setInterval(async()=>{
       saveToDrive = window.saveToDrive = wrapped;
     }catch(err){ try { console.warn('[opener-bias-monitor] wrap install failed:', err); } catch(e){} }
   }, 400);
+})();
+/* ===== end DLA hotfix ===== */
+
+
+/* ===== DLA hotfix: pause live Drive sync during long bulk jobs =====
+   These jobs hold unit numbers (positions in DATA) across waits. If the live sync
+   swapped DATA mid-job, those numbers would point at the wrong units. Each one
+   sets window.DLA_BULK_BUSY while it runs (counted, so nested jobs are safe).
+   Installed last so it wraps the final version of each function. */
+(function(){
+  if(typeof dlaWithBulkBusy_ !== 'function') return;
+  if(typeof fixAllOfType === 'function') fixAllOfType = window.fixAllOfType = dlaWithBulkBusy_(fixAllOfType);
+  // Inspire All runs server-side for a long time: allow 45 minutes before it is ignored.
+  if(typeof inspireAllBatch === 'function') inspireAllBatch = window.inspireAllBatch = dlaWithBulkBusy_(inspireAllBatch, 45 * 60 * 1000);
+  if(typeof sweepAppSmashesBatch === 'function') sweepAppSmashesBatch = window.sweepAppSmashesBatch = dlaWithBulkBusy_(sweepAppSmashesBatch);
+  if(typeof rebootMakerspaceBatch === 'function') rebootMakerspaceBatch = window.rebootMakerspaceBatch = dlaWithBulkBusy_(rebootMakerspaceBatch);
+  if(typeof runBulkRegen === 'function') runBulkRegen = window.runBulkRegen = dlaWithBulkBusy_(runBulkRegen);
+  if(typeof runSurgeon === 'function') runSurgeon = window.runSurgeon = dlaWithBulkBusy_(runSurgeon);
+  if(typeof runAutoDiversify === 'function') runAutoDiversify = window.runAutoDiversify = dlaWithBulkBusy_(runAutoDiversify);
+  if(typeof draftAllRealismFixes === 'function') draftAllRealismFixes = window.draftAllRealismFixes = dlaWithBulkBusy_(draftAllRealismFixes);
+  if(typeof bulkChatSend === 'function') bulkChatSend = window.bulkChatSend = dlaWithBulkBusy_(bulkChatSend);
+  if(typeof startBulkAnalysis === 'function') startBulkAnalysis = window.startBulkAnalysis = dlaWithBulkBusy_(startBulkAnalysis);
+  if(typeof applyChangesFromPopup === 'function') applyChangesFromPopup = window.applyChangesFromPopup = dlaWithBulkBusy_(applyChangesFromPopup);
+})();
+/* ===== end DLA hotfix ===== */
+
+
+/* ===== DLA hotfix: reloads wait for saves =====
+   A full reload replaces DATA. Run through the same queue as saves, so it never lands in
+   the middle of one (which would swap the data under the upload). Installed last so it
+   wraps the final version of each function. */
+(function(){
+  function queued(orig){
+    return function(){
+      const self = this, args = arguments;
+      return driveWriteQueue_(function(){ return orig.apply(self, args); });
+    };
+  }
+  if(typeof reloadFromDrive === 'function') reloadFromDrive = window.reloadFromDrive = queued(reloadFromDrive);
+  if(typeof loadFromDrive === 'function') loadFromDrive = window.loadFromDrive = queued(loadFromDrive);
 })();
 /* ===== end DLA hotfix ===== */

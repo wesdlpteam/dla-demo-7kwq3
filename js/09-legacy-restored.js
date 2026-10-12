@@ -321,13 +321,13 @@ function applyChangesFromPopup(){
   delete window._popupChanges;
   delete window._popupUpdateCounter;
 
-  saveToDrive();
+  saveToDrive().catch(showSaveError_);
   const dupeNote = skippedDupes ? ` (skipped ${skippedDupes} duplicate${skippedDupes!==1?'s':''})` : '';
   if(appliedRealismFixes){
-    setStatus(`${applied} suggestion${applied!==1?'s':''} updated and saved${dupeNote} — rescanning realism audit…`, 'loading');
+    setStatus(`${applied} suggestion${applied!==1?'s':''} updated${dupeNote} — saving, then rescanning realism audit…`, 'loading');
     setTimeout(() => rescanRealismAfterApprovedFixes_(applied, skippedDupes), 250);
   } else {
-    setStatus(`${applied} suggestion${applied!==1?'s':''} updated and saved${dupeNote}`);
+    setStatus(`${applied} suggestion${applied!==1?'s':''} updated${dupeNote} — saving to Drive…`, 'loading');
   }
   renderAuditChart();
   if(typeof renderBrowse === 'function') renderBrowse();
